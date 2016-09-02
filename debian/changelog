@@ -1,0 +1,5 @@
+python-h2 (2.4.1-1) unstable; urgency=low
+
+  * New package (Closes: #836359)
+
+ -- Sebastien Delafond <seb@debian.org>  Fri, 02 Sep 2016 08:22:19 +0200

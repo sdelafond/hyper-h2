@@ -1,0 +1,10 @@
+#!/usr/bin/make -f
+
+export PYBUILD_NAME=h2
+export PYBUILD_TEST_ARGS="-k-test/test_rfc7838.py"
+
+%:
+	dh $@ --with python2,python3 --buildsystem=pybuild
+
+override_dh_installchangelogs:
+	dh_installchangelogs HISTORY.rst
