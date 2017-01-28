@@ -1,6 +1,150 @@
 Release History
 ===============
 
+2.5.2 (2017-01-27)
+------------------
+
+- Resolved issue where the ``HTTP2-Settings`` header value for plaintext
+  upgrade that was emitted by ``initiate_upgrade_connection`` included the
+  *entire* ``SETTINGS`` frame, instead of just the payload.
+- Resolved issue where the ``HTTP2-Settings`` header value sent by a client for
+  plaintext upgrade would be ignored by ``initiate_upgrade_connection``, rather
+  than have those settings applied appropriately.
+
+
+2.4.3 (2017-01-27)
+------------------
+
+- Resolved issue where the ``HTTP2-Settings`` header value for plaintext
+  upgrade that was emitted by ``initiate_upgrade_connection`` included the
+  *entire* ``SETTINGS`` frame, instead of just the payload.
+- Resolved issue where the ``HTTP2-Settings`` header value sent by a client for
+  plaintext upgrade would be ignored by ``initiate_upgrade_connection``, rather
+  than have those settings applied appropriately.
+
+
+2.3.4 (2017-01-27)
+------------------
+
+- Resolved issue where the ``HTTP2-Settings`` header value for plaintext
+  upgrade that was emitted by ``initiate_upgrade_connection`` included the
+  *entire* ``SETTINGS`` frame, instead of just the payload.
+- Resolved issue where the ``HTTP2-Settings`` header value sent by a client for
+  plaintext upgrade would be ignored by ``initiate_upgrade_connection``, rather
+  than have those settings applied appropriately.
+
+
+2.5.1 (2016-12-17)
+------------------
+
+Bugfixes
+~~~~~~~~
+
+- Remote peers are now allowed to send zero or any positive number as a value
+  for ``SETTINGS_MAX_HEADER_LIST_SIZE``, where previously sending zero would
+  raise a ``InvalidSettingsValueError``.
+
+2.5.0 (2016-10-25)
+------------------
+
+API Changes (Backward-Compatible)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- Added a new ``H2Configuration`` object that allows rich configuration of
+  a ``H2Connection``. This object supersedes the prior keyword arguments to the
+  ``H2Connection`` object, which are now deprecated and will be removed in 3.0.
+- Added support for automated window management via the
+  ``acknowledge_received_data`` method. See the documentation for more details.
+- Added a ``DenialOfServiceError`` that is raised whenever a behaviour that
+  looks like a DoS attempt is encountered: for example, an overly large
+  decompressed header list. This is a subclass of ``ProtocolError``.
+- Added support for setting and managing ``SETTINGS_MAX_HEADER_LIST_SIZE``.
+  This setting is now defaulted to 64kB.
+- Added ``h2.errors.ErrorCodes``, an enum that is used to store all the HTTP/2
+  error codes. This allows us to use a better printed representation of the
+  error code in most places that it is used.
+- The ``error_code`` fields on ``ConnectionTerminated`` and ``StreamReset``
+  events have been updated to be instances of ``ErrorCodes`` whenever they
+  correspond to a known error code. When they are an unknown error code, they
+  are instead ``int``. As ``ErrorCodes`` is a subclass of ``int``, this is
+  non-breaking.
+- Deprecated the other fields in ``h2.errors``. These will be removed in 3.0.0.
+
+Bugfixes
+~~~~~~~~
+
+- Correctly reject request header blocks with neither :authority nor Host
+  headers, or header blocks which contain mismatched :authority and Host
+  headers, per RFC 7540 Section 8.1.2.3.
+- Correctly expect that responses to HEAD requests will have no body regardless
+  of the value of the Content-Length header, and reject those that do.
+- Correctly refuse to send header blocks that contain neither :authority nor
+  Host headers, or header blocks which contain mismatched :authority and Host
+  headers, per RFC 7540 Section 8.1.2.3.
+- Hyper-h2 will now reject header field names and values that contain leading
+  or trailing whitespace.
+- Correctly strip leading/trailing whitespace from header field names and
+  values.
+- Correctly refuse to send header blocks with a TE header whose value is not
+  ``trailers``, per RFC 7540 Section 8.1.2.2.
+- Correctly refuse to send header blocks with connection-specific headers,
+  per RFC 7540 Section 8.1.2.2.
+- Correctly refuse to send header blocks that contain duplicate pseudo-header
+  fields, or with pseudo-header fields that appear after ordinary header fields,
+  per RFC 7540 Section 8.1.2.1.
+
+  This may cause passing a dictionary as the header block to ``send_headers``
+  to throw a ``ProtocolError``, because dictionaries are unordered and so they
+  may trip this check.  Passing dictionaries here is deprecated, and callers
+  should change to using a sequence of 2-tuples as their header blocks.
+- Correctly reject trailers that contain HTTP/2 pseudo-header fields, per RFC
+  7540 Section 8.1.2.1.
+- Correctly refuse to send trailers that contain HTTP/2 pseudo-header fields,
+  per RFC 7540 Section 8.1.2.1.
+- Correctly reject responses that do not contain the ``:status`` header field,
+  per RFC 7540 Section 8.1.2.4.
+- Correctly refuse to send responses that do not contain the ``:status`` header
+  field, per RFC 7540 Section 8.1.2.4.
+- Correctly update the maximum frame size when the user updates the value of
+  that setting. Prior to this release, if the user updated the maximum frame
+  size hyper-h2 would ignore the update, preventing the remote peer from using
+  the higher frame sizes.
+
+2.4.2 (2016-10-25)
+------------------
+
+Bugfixes
+~~~~~~~~
+
+- Correctly update the maximum frame size when the user updates the value of
+  that setting. Prior to this release, if the user updated the maximum frame
+  size hyper-h2 would ignore the update, preventing the remote peer from using
+  the higher frame sizes.
+
+2.3.3 (2016-10-25)
+------------------
+
+Bugfixes
+~~~~~~~~
+
+- Correctly update the maximum frame size when the user updates the value of
+  that setting. Prior to this release, if the user updated the maximum frame
+  size hyper-h2 would ignore the update, preventing the remote peer from using
+  the higher frame sizes.
+
+2.2.7 (2016-10-25)
+------------------
+
+*Final 2.2.X release*
+
+Bugfixes
+~~~~~~~~
+
+- Correctly update the maximum frame size when the user updates the value of
+  that setting. Prior to this release, if the user updated the maximum frame
+  size hyper-h2 would ignore the update, preventing the remote peer from using
+  the higher frame sizes.
+
 2.4.1 (2016-08-23)
 ------------------
 
@@ -11,15 +155,6 @@ Bugfixes
   of the value of the Content-Length header, and reject those that do.
 
 2.3.2 (2016-08-23)
-------------------
-
-Bugfixes
-~~~~~~~~
-
-- Correctly expect that responses to HEAD requests will have no body regardless
-  of the value of the Content-Length header, and reject those that do.
-
-2.2.6 (2016-08-23)
 ------------------
 
 Bugfixes
@@ -42,6 +177,9 @@ API Changes (Backward-Compatible)
 - Add support for emitting stream priority information when sending headers
   frames using three new keyword arguments: ``priority_weight``,
   ``priority_depends_on``, and ``priority_exclusive``.
+- Add support for "related events": events that fire simultaneously on a single
+  frame.
+
 
 2.3.1 (2016-05-12)
 ------------------

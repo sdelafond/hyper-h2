@@ -14,19 +14,22 @@ from hyperframe.frame import (
     RstStreamFrame, PushPromiseFrame, AltSvcFrame
 )
 
-from .errors import STREAM_CLOSED
+from .errors import ErrorCodes, _error_code_from_int
 from .events import (
     RequestReceived, ResponseReceived, DataReceived, WindowUpdated,
     StreamEnded, PushedStreamReceived, StreamReset, TrailersReceived,
-    InformationalResponseReceived, AlternativeServiceAvailable
+    InformationalResponseReceived, AlternativeServiceAvailable,
+    _ResponseSent, _RequestSent, _TrailersSent
 )
 from .exceptions import (
     ProtocolError, StreamClosedError, InvalidBodyLengthError
 )
 from .utilities import (
     guard_increment_window, is_informational_response, authority_from_headers,
-    secure_headers, extract_method_header
+    validate_headers, validate_outbound_headers, normalize_outbound_headers,
+    HeaderValidationFlags, extract_method_header
 )
+from .windows import WindowManager
 
 
 class StreamState(IntEnum):
@@ -131,7 +134,9 @@ class H2StreamStateMachine(object):
         """
         self.client = True
         self.headers_sent = True
-        return []
+        event = _RequestSent()
+
+        return [event]
 
     def response_sent(self, previous_state):
         """
@@ -142,11 +147,13 @@ class H2StreamStateMachine(object):
             if self.client is True or self.client is None:
                 raise ProtocolError("Client cannot send responses.")
             self.headers_sent = True
+            event = _ResponseSent()
         else:
             assert not self.trailers_sent
             self.trailers_sent = True
+            event = _TrailersSent()
 
-        return []
+        return [event]
 
     def request_received(self, previous_state):
         """
@@ -276,7 +283,7 @@ class H2StreamStateMachine(object):
         if previous_state != StreamState.CLOSED:
             event = StreamReset()
             event.stream_id = self.stream_id
-            event.error_code = STREAM_CLOSED
+            event.error_code = ErrorCodes.STREAM_CLOSED
             event.remote_reset = False
             events.append(event)
 
@@ -320,7 +327,8 @@ class H2StreamStateMachine(object):
         if self.headers_sent:
             raise ProtocolError("Information response after final response")
 
-        return []
+        event = _ResponseSent()
+        return [event]
 
     def recv_informational_response(self, previous_state):
         """
@@ -664,15 +672,21 @@ class H2Stream(object):
     Attempts to create frames that cannot be sent will raise a
     ``ProtocolError``.
     """
-    def __init__(self, stream_id):
+    def __init__(self,
+                 stream_id,
+                 config,
+                 inbound_window_size,
+                 outbound_window_size):
         self.state_machine = H2StreamStateMachine(stream_id)
         self.stream_id = stream_id
         self.max_outbound_frame_size = None
         self.request_method = None
 
-        # The curent value of the stream flow control windows
-        self.outbound_flow_control_window = 65535
-        self.inbound_flow_control_window = 65535
+        # The curent value of the outbound stream flow control window
+        self.outbound_flow_control_window = outbound_window_size
+
+        # The flow control manager.
+        self._inbound_window_manager = WindowManager(inbound_window_size)
 
         # The expected content length, if any.
         self._expected_content_length = None
@@ -682,6 +696,19 @@ class H2Stream(object):
 
         # The authority we believe this stream belongs to.
         self._authority = None
+
+        # The configuration for this stream.
+        self.config = config
+
+    @property
+    def inbound_flow_control_window(self):
+        """
+        The size of the inbound flow control window for the stream. This is
+        rarely publicly useful: instead, use :meth:`remote_flow_control_window
+        <h2.stream.H2Stream.remote_flow_control_window>`. This shortcut is
+        largely present to provide a shortcut to this data.
+        """
+        return self._inbound_window_manager.current_window_size
 
     @property
     def open(self):
@@ -727,12 +754,12 @@ class H2Stream(object):
         # Convert headers to two-tuples.
         # FIXME: The fallback for dictionary headers is to be removed in 3.0.
         try:
+            headers = headers.items()
             warnings.warn(
                 "Implicit conversion of dictionaries to two-tuples for "
                 "headers is deprecated and will be removed in 3.0.",
                 DeprecationWarning
             )
-            headers = headers.items()
         except AttributeError:
             headers = headers
 
@@ -753,12 +780,13 @@ class H2Stream(object):
 
             input_ = StreamInputs.SEND_INFORMATIONAL_HEADERS
 
-        # This does not trigger any events.
         events = self.state_machine.process_input(input_)
-        assert not events
 
         hf = HeadersFrame(self.stream_id)
-        frames = self._build_headers_frames(headers, encoder, hf)
+        hdr_validation_flags = self._build_hdr_validation_flags(events)
+        frames = self._build_headers_frames(
+            headers, encoder, hf, hdr_validation_flags
+        )
 
         if end_stream:
             # Not a bug: the END_STREAM flag is valid on the initial HEADERS
@@ -794,7 +822,10 @@ class H2Stream(object):
 
         ppf = PushPromiseFrame(self.stream_id)
         ppf.promised_stream_id = related_stream_id
-        frames = self._build_headers_frames(headers, encoder, ppf)
+        hdr_validation_flags = self._build_hdr_validation_flags(events)
+        frames = self._build_headers_frames(
+            headers, encoder, ppf, hdr_validation_flags
+        )
 
         return frames
 
@@ -854,6 +885,8 @@ class H2Stream(object):
         Increase the size of the flow control window for the remote side.
         """
         self.state_machine.process_input(StreamInputs.SEND_WINDOW_UPDATE)
+        self._inbound_window_manager.window_opened(increment)
+
         wuf = WindowUpdateFrame(self.stream_id)
         wuf.window_increment = increment
         return [wuf]
@@ -917,6 +950,10 @@ class H2Stream(object):
             if not end_stream:
                 raise ProtocolError("Trailers must have END_STREAM set")
 
+        if self.config.validate_inbound_headers:
+            hdr_validation_flags = self._build_hdr_validation_flags(events)
+            headers = validate_headers(headers, hdr_validation_flags)
+
         if header_encoding:
             headers = list(_decode_headers(headers, header_encoding))
 
@@ -928,7 +965,7 @@ class H2Stream(object):
         Receive some data.
         """
         events = self.state_machine.process_input(StreamInputs.RECV_DATA)
-        self.inbound_flow_control_window -= flow_control_len
+        self._inbound_window_manager.window_consumed(flow_control_len)
         self._track_content_length(len(data), end_stream)
 
         if end_stream:
@@ -1009,21 +1046,76 @@ class H2Stream(object):
 
         if events:
             # We don't fire an event if this stream is already closed.
-            events[0].error_code = frame.error_code
+            events[0].error_code = _error_code_from_int(frame.error_code)
 
         return [], events
+
+    def acknowledge_received_data(self, acknowledged_size):
+        """
+        The user has informed us that they've processed some amount of data
+        that was received on this stream. Pass that to the window manager and
+        potentially return some WindowUpdate frames.
+        """
+        increment = self._inbound_window_manager.process_bytes(
+            acknowledged_size
+        )
+        if increment:
+            f = WindowUpdateFrame(self.stream_id)
+            f.window_increment = increment
+            return [f]
+
+        return []
+
+    def _build_hdr_validation_flags(self, events):
+        """
+        Constructs a set of header validation flags for use when normalizing
+        and validating header blocks.
+        """
+        try:
+            is_trailer = isinstance(
+                events[0], (_TrailersSent, TrailersReceived)
+            )
+            is_response_header = isinstance(
+                events[0], (_ResponseSent, ResponseReceived)
+            )
+        except IndexError:
+            # Some state changes don't emit an internal event (for example,
+            # sending a push promise).  We *always* emit an event for trailers,
+            # so the absence of an event means this definitely isn't a trailer.
+            # Similarly, we also emit an event whenever response headers are
+            # sent or received. So absence of those events means this is not an
+            # response header either.
+            #
+            # TODO: Find any places where we don't emit anything, and emit
+            # an internal event, so we can do away with this branch.
+            is_trailer = False
+            is_response_header = False
+
+        return HeaderValidationFlags(
+            is_client=self.state_machine.client,
+            is_trailer=is_trailer,
+            is_response_header=is_response_header
+        )
 
     def _build_headers_frames(self,
                               headers,
                               encoder,
-                              first_frame):
+                              first_frame,
+                              hdr_validation_flags):
         """
         Helper method to build headers or push promise frames.
         """
         # We need to lowercase the header names, and to ensure that secure
         # header fields are kept out of compression contexts.
-        headers = _lowercase_header_names(headers)
-        headers = secure_headers(headers)
+        if self.config.normalize_outbound_headers:
+            headers = normalize_outbound_headers(
+                headers, hdr_validation_flags
+            )
+        if self.config.validate_outbound_headers:
+            headers = validate_outbound_headers(
+                headers, hdr_validation_flags
+            )
+
         encoded_headers = encoder.encode(headers)
 
         # Slice into blocks of max_outbound_frame_size. Be careful with this:
@@ -1090,18 +1182,17 @@ class H2Stream(object):
             if end_stream and expected != actual:
                 raise InvalidBodyLengthError(expected, actual)
 
-
-def _lowercase_header_names(headers):
-    """
-    Given an iterable of header two-tuples, rebuilds that iterable with the
-    header names lowercased. This generator produces tuples that preserve the
-    original type of the header tuple for tuple and any ``HeaderTuple``.
-    """
-    for header in headers:
-        if isinstance(header, HeaderTuple):
-            yield header.__class__(header[0].lower(), header[1])
-        else:
-            yield (header[0].lower(), header[1])
+    def _inbound_flow_control_change_from_settings(self, delta):
+        """
+        We changed SETTINGS_INITIAL_WINDOW_SIZE, which means we need to
+        update the target window size for flow control. For our flow control
+        strategy, this means we need to do two things: we need to adjust the
+        current window size, but we also need to set the target maximum window
+        size to the new value.
+        """
+        new_max_size = self._inbound_window_manager.max_window_size + delta
+        self._inbound_window_manager.window_opened(delta)
+        self._inbound_window_manager.max_window_size = new_max_size
 
 
 def _decode_headers(headers, encoding):

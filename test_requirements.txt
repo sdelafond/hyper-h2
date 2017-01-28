@@ -1,4 +1,5 @@
-pytest==2.9.2
-pytest-cov==2.2.1
-pytest-xdist==1.14
-hypothesis==3.4.0
+pytest==3.0.6
+pytest-cov==2.4.0
+coverage==4.3.4
+pytest-xdist==1.15.0
+hypothesis==3.6.1

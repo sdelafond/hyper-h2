@@ -5,9 +5,12 @@ h2/utilities
 
 Utility functions that do not belong in a separate module.
 """
+import collections
 import re
+from string import whitespace
+import sys
 
-from hpack import NeverIndexedHeaderTuple
+from hpack import HeaderTuple, NeverIndexedHeaderTuple
 
 from .exceptions import ProtocolError, FlowControlError
 
@@ -15,22 +18,22 @@ UPPER_RE = re.compile(b"[A-Z]")
 
 # A set of headers that are hop-by-hop or connection-specific and thus
 # forbidden in HTTP/2. This list comes from RFC 7540 § 8.1.2.2.
-CONNECTION_HEADERS = {
-    b'connection',
-    b'proxy-connection',
-    b'keep-alive',
-    b'transfer-encoding',
-    b'upgrade',
-}
+CONNECTION_HEADERS = frozenset([
+    b'connection', u'upgrade',
+    b'proxy-connection', u'transfer-encoding',
+    b'keep-alive', u'keep-alive',
+    b'transfer-encoding', u'proxy-connection',
+    b'upgrade', u'connection',
+])
 
 
-_ALLOWED_PSEUDO_HEADER_FIELDS = {
-    b':method',
-    b':scheme',
-    b':authority',
-    b':path',
-    b':status',
-}
+_ALLOWED_PSEUDO_HEADER_FIELDS = frozenset([
+    b':method', u':method',
+    b':scheme', u':scheme',
+    b':authority', u':authority',
+    b':path', u':path',
+    b':status', u':status',
+])
 
 
 _SECURE_HEADERS = frozenset([
@@ -39,8 +42,13 @@ _SECURE_HEADERS = frozenset([
     b'proxy-authorization', u'proxy-authorization',
 ])
 
+if sys.version_info[0] == 2:  # Python 2.X
+    _WHITESPACE = frozenset(whitespace)
+else:  # Python 3.3+
+    _WHITESPACE = frozenset(map(ord, whitespace))
 
-def secure_headers(headers):
+
+def _secure_headers(headers, hdr_validation_flags):
     """
     Certain headers are at risk of being attacked during the header compression
     phase, and so need to be kept out of header compression contexts. This
@@ -69,7 +77,7 @@ def secure_headers(headers):
 
 def extract_method_header(headers):
     """
-    Extracts the request method from the headers list
+    Extracts the request method from the headers list.
     """
     for k, v in headers:
         if k in (b':method', u':method'):
@@ -159,9 +167,20 @@ def authority_from_headers(headers):
     return None
 
 
-def validate_headers(headers):
+# Flags used by the validate_headers pipeline to determine which checks
+# should be applied to a given set of headers.
+HeaderValidationFlags = collections.namedtuple(
+    'HeaderValidationFlags',
+    ['is_client', 'is_trailer', 'is_response_header']
+)
+
+
+def validate_headers(headers, hdr_validation_flags):
     """
     Validates a header sequence against a set of constraints from RFC 7540.
+
+    :param headers: The HTTP header set.
+    :param hdr_validation_flags: An instance of HeaderValidationFlags.
     """
     # This validation logic is built on a sequence of generators that are
     # iterated over to provide the final header list. This reduces some of the
@@ -172,14 +191,29 @@ def validate_headers(headers):
     # For example, we avoid tuple upacking in loops because it represents a
     # fixed cost that we don't want to spend, instead indexing into the header
     # tuples.
-    headers = _reject_uppercase_header_fields(headers)
-    headers = _reject_te(headers)
-    headers = _reject_connection_header(headers)
-    headers = _reject_pseudo_header_fields(headers)
+    headers = _reject_uppercase_header_fields(
+        headers, hdr_validation_flags
+    )
+    headers = _reject_surrounding_whitespace(
+        headers, hdr_validation_flags
+    )
+    headers = _reject_te(
+        headers, hdr_validation_flags
+    )
+    headers = _reject_connection_header(
+        headers, hdr_validation_flags
+    )
+    headers = _reject_pseudo_header_fields(
+        headers, hdr_validation_flags
+    )
+    headers = _check_host_authority_header(
+        headers, hdr_validation_flags
+    )
+
     return list(headers)
 
 
-def _reject_uppercase_header_fields(headers):
+def _reject_uppercase_header_fields(headers, hdr_validation_flags):
     """
     Raises a ProtocolError if any uppercase character is found in a header
     block.
@@ -191,14 +225,36 @@ def _reject_uppercase_header_fields(headers):
         yield header
 
 
-def _reject_te(headers):
+def _reject_surrounding_whitespace(headers, hdr_validation_flags):
+    """
+    Raises a ProtocolError if any header name or value is surrounded by
+    whitespace characters.
+    """
+    # For compatibility with RFC 7230 header fields, we need to allow the field
+    # value to be an empty string. This is ludicrous, but technically allowed.
+    # The field name may not be empty, though, so we can safely assume that it
+    # must have at least one character in it and throw exceptions if it
+    # doesn't.
+    for header in headers:
+        if header[0][0] in _WHITESPACE or header[0][-1] in _WHITESPACE:
+            raise ProtocolError(
+                "Received header name surrounded by whitespace %r" % header[0])
+        if header[1] and ((header[1][0] in _WHITESPACE) or
+           (header[1][-1] in _WHITESPACE)):
+            raise ProtocolError(
+                "Received header value surrounded by whitespace %r" % header[1]
+            )
+        yield header
+
+
+def _reject_te(headers, hdr_validation_flags):
     """
     Raises a ProtocolError if the TE header is present in a header block and
     its value is anything other than "trailers".
     """
     for header in headers:
-        if header[0] == b'te':
-            if header[1].lower().strip() != b'trailers':
+        if header[0] in (b'te', u'te'):
+            if header[1].lower() not in (b'trailers', u'trailers'):
                 raise ProtocolError(
                     "Invalid value for Transfer-Encoding header: %s" %
                     header[1]
@@ -207,7 +263,7 @@ def _reject_te(headers):
         yield header
 
 
-def _reject_connection_header(headers):
+def _reject_connection_header(headers, hdr_validation_flags):
     """
     Raises a ProtocolError if the Connection header is present in a header
     block.
@@ -221,17 +277,30 @@ def _reject_connection_header(headers):
         yield header
 
 
-def _reject_pseudo_header_fields(headers):
+def _custom_startswith(test_string, bytes_prefix, unicode_prefix):
+    """
+    Given a string that might be a bytestring or a Unicode string,
+    return True if it starts with the appropriate prefix.
+    """
+    if isinstance(test_string, bytes):
+        return test_string.startswith(bytes_prefix)
+    else:
+        return test_string.startswith(unicode_prefix)
+
+
+def _reject_pseudo_header_fields(headers, hdr_validation_flags):
     """
     Raises a ProtocolError if duplicate pseudo-header fields are found in a
-    header block or if a pseudo-header field arrives in a block after an
+    header block or if a pseudo-header field appears in a block after an
     ordinary header field.
+
+    Raises a ProtocolError if pseudo-header fields are found in trailers.
     """
     seen_pseudo_header_fields = set()
     seen_regular_header = False
 
     for header in headers:
-        if header[0].startswith(b':'):
+        if _custom_startswith(header[0], b':', u':'):
             if header[0] in seen_pseudo_header_fields:
                 raise ProtocolError(
                     "Received duplicate pseudo-header field %s" % header[0]
@@ -254,3 +323,167 @@ def _reject_pseudo_header_fields(headers):
             seen_regular_header = True
 
         yield header
+
+    # Pseudo-header fields MUST NOT appear in trailers - RFC 7540 § 8.1.2.1
+    if hdr_validation_flags.is_trailer and seen_pseudo_header_fields:
+        raise ProtocolError(
+            "Received pseudo-header in trailer %s" %
+            seen_pseudo_header_fields
+        )
+
+    # If ':status' pseudo-header is not there in a response header, reject it
+    # Relevant RFC section: RFC 7540 § 8.1.2.4
+    # https://tools.ietf.org/html/rfc7540#section-8.1.2.4
+    if hdr_validation_flags.is_response_header:
+        seen_status_field = (
+            b':status' in seen_pseudo_header_fields or
+            u':status' in seen_pseudo_header_fields
+        )
+        if not seen_status_field:
+            raise ProtocolError(
+                "Response header block does not have a :status header"
+            )
+
+
+def _validate_host_authority_header(headers):
+    """
+    Given the :authority and Host headers from a request block that isn't
+    a trailer, check that:
+     1. At least one of these headers is set.
+     2. If both headers are set, they match.
+
+    :param headers: The HTTP header set.
+    :raises: ``ProtocolError``
+    """
+    # We use None as a sentinel value.  Iterate over the list of headers,
+    # and record the value of these headers (if present).  We don't need
+    # to worry about receiving duplicate :authority headers, as this is
+    # enforced by the _reject_pseudo_header_fields() pipeline.
+    #
+    # TODO: We should also guard against receiving duplicate Host headers,
+    # and against sending duplicate headers.
+    authority_header_val = None
+    host_header_val = None
+
+    for header in headers:
+        if header[0] in (b':authority', u':authority'):
+            authority_header_val = header[1]
+        elif header[0] in (b'host', u'host'):
+            host_header_val = header[1]
+
+        yield header
+
+    # If we have not-None values for these variables, then we know we saw
+    # the corresponding header.
+    authority_present = (authority_header_val is not None)
+    host_present = (host_header_val is not None)
+
+    # It is an error for a request header block to contain neither
+    # an :authority header nor a Host header.
+    if not authority_present and not host_present:
+        raise ProtocolError(
+            "Request header block does not have an :authority or Host header."
+        )
+
+    # If we receive both headers, they should definitely match.
+    if authority_present and host_present:
+        if authority_header_val != host_header_val:
+            raise ProtocolError(
+                "Request header block has mismatched :authority and "
+                "Host headers: %r / %r"
+                % (authority_header_val, host_header_val)
+            )
+
+
+def _check_host_authority_header(headers, hdr_validation_flags):
+    """
+    Raises a ProtocolError if a header block arrives that does not contain an
+    :authority or a Host header, or if a header block contains both fields,
+    but their values do not match.
+    """
+    # We only expect to see :authority and Host headers on request header
+    # blocks that aren't trailers, so skip this validation if we're on the
+    # server side or looking at trailer blocks.
+    if hdr_validation_flags.is_client or hdr_validation_flags.is_trailer:
+        return headers
+
+    return _validate_host_authority_header(headers)
+
+
+def _lowercase_header_names(headers, hdr_validation_flags):
+    """
+    Given an iterable of header two-tuples, rebuilds that iterable with the
+    header names lowercased. This generator produces tuples that preserve the
+    original type of the header tuple for tuple and any ``HeaderTuple``.
+    """
+    for header in headers:
+        if isinstance(header, HeaderTuple):
+            yield header.__class__(header[0].lower(), header[1])
+        else:
+            yield (header[0].lower(), header[1])
+
+
+def _strip_surrounding_whitespace(headers, hdr_validation_flags):
+    """
+    Given an iterable of header two-tuples, strip both leading and trailing
+    whitespace from both header names and header values. This generator
+    produces tuples that preserve the original type of the header tuple for
+    tuple and any ``HeaderTuple``.
+    """
+    for header in headers:
+        if isinstance(header, HeaderTuple):
+            yield header.__class__(header[0].strip(), header[1].strip())
+        else:
+            yield (header[0].strip(), header[1].strip())
+
+
+def _check_sent_host_authority_header(headers, hdr_validation_flags):
+    """
+    Raises an InvalidHeaderBlockError if we try to send a header block
+    that does not contain an :authority or a Host header, or if
+    the header block contains both fields, but their values do not match.
+    """
+    # We only expect to see :authority and Host headers on request header
+    # blocks that aren't trailers, so skip this validation if we're on the
+    # server side or looking at trailer blocks.
+    if not hdr_validation_flags.is_client or hdr_validation_flags.is_trailer:
+        return headers
+
+    return _validate_host_authority_header(headers)
+
+
+def normalize_outbound_headers(headers, hdr_validation_flags):
+    """
+    Normalizes a header sequence that we are about to send.
+
+    :param headers: The HTTP header set.
+    :param hdr_validation_flags: An instance of HeaderValidationFlags.
+    """
+    headers = _lowercase_header_names(headers, hdr_validation_flags)
+    headers = _strip_surrounding_whitespace(headers, hdr_validation_flags)
+    headers = _secure_headers(headers, hdr_validation_flags)
+
+    return headers
+
+
+def validate_outbound_headers(headers, hdr_validation_flags):
+    """
+    Validates and normalizes a header sequence that we are about to send.
+
+    :param headers: The HTTP header set.
+    :param hdr_validation_flags: An instance of HeaderValidationFlags.
+    """
+    headers = _reject_te(
+        headers, hdr_validation_flags
+    )
+    headers = _reject_connection_header(
+        headers, hdr_validation_flags
+    )
+    headers = _reject_pseudo_header_fields(
+        headers, hdr_validation_flags
+    )
+    headers = _check_sent_host_authority_header(
+        headers, hdr_validation_flags
+    )
+
+    return headers

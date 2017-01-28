@@ -18,7 +18,7 @@ from twisted.internet.ssl import optionsForClientTLS
 from hyperframe.frame import SettingsFrame
 from h2.connection import H2Connection
 from h2.events import (
-    ResponseReceived, DataReceived, RemoteSettingsChanged, StreamEnded,
+    ResponseReceived, DataReceived, StreamEnded,
     StreamReset, SettingsAcknowledged,
 )
 
@@ -44,7 +44,7 @@ class H2Protocol(Protocol):
 
     def dataReceived(self, data):
         if not self.known_proto:
-            self.known_proto = self.transport.getNextProtocol()
+            self.known_proto = self.transport.negotiatedProtocol
             assert self.known_proto == b'h2'
 
         events = self.conn.receive_data(data)
@@ -101,7 +101,7 @@ class H2Protocol(Protocol):
 
 options = optionsForClientTLS(
     hostname=AUTHORITY,
-    extraCertificateOptions={'nextProtocols': [b'h2']},
+    acceptableProtocols=[b'h2'],
 )
 
 connectProtocol(
