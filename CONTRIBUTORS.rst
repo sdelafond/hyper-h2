@@ -73,3 +73,33 @@ In chronological order:
   - Fixed the broken Twisted HEAD request example.
   - Added verification logic for ensuring that responses to HEAD requests have
     no body.
+
+- Lorenzo (@Mec-iS)
+
+  - Changed documentation to stop using dictionaries for header blocks.
+
+- Kracekumar Ramaraj (@kracekumar)
+
+  - Cleaned up Twisted example.
+
+- @mlvnd
+
+  - Cleaned up curio example.
+
+- Tom Offermann (@toffer)
+
+  - Added Tornado example.
+
+- Tarashish Mishra (@sunu)
+
+  - Added code to reject header fields with leading/trailing whitespace.
+  - Added code to remove leading/trailing whitespace from sent header fields.
+
+- Nate Prewitt (@nateprewitt)
+
+  - Added code to validate that trailers do not contain pseudo-header fields.
+
+Chun-Han, Hsiao (@chhsiao90)
+
+  - Fixed a bug with invalid ``HTTP2-Settings`` header output in plaintext
+    upgrade.

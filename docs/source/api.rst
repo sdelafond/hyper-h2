@@ -17,6 +17,14 @@ Connection
 
 .. autoclass:: h2.connection.H2Connection
    :members:
+   :exclude-members: inbound_flow_control_window
+
+
+Configuration
+-------------
+
+.. autoclass:: h2.config.H2Configuration
+   :members:
 
 
 .. _h2-events-api:
@@ -74,7 +82,6 @@ Exceptions
 ----------
 
 .. autoclass:: h2.exceptions.H2Error
-   :show-inheritance:
    :members:
 
 .. autoclass:: h2.exceptions.NoSuchStreamError
@@ -118,7 +125,6 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.InvalidSettingsValueError
-   :show-inheritance:
    :members:
 
 .. autoclass:: h2.exceptions.NoAvailableStreamIDError
@@ -130,6 +136,9 @@ Protocol Errors
    :members:
 
 .. autoclass:: h2.exceptions.UnsupportedFrameError
+   :members:
+
+.. autoclass:: h2.exceptions.DenialOfServiceError
    :show-inheritance:
    :members:
 
@@ -164,3 +173,5 @@ Known Settings
 .. autodata:: h2.settings.INITIAL_WINDOW_SIZE
 
 .. autodata:: h2.settings.MAX_FRAME_SIZE
+
+.. autodata:: h2.settings.MAX_HEADER_LIST_SIZE

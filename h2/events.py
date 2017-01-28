@@ -56,7 +56,7 @@ class RequestReceived(object):
 
 class ResponseReceived(object):
     """
-    The ResponseReceived event is fired whenever request headers are received.
+    The ResponseReceived event is fired whenever response headers are received.
     This event carries the HTTP headers for the given response and the stream
     ID of the new stream.
 
@@ -136,6 +136,51 @@ class TrailersReceived(object):
         )
 
 
+class _HeadersSent(object):
+    """
+    The _HeadersSent event is fired whenever headers are sent.
+
+    This is an internal event, used to determine validation steps on
+    outgoing header blocks.
+    """
+    pass
+
+
+class _ResponseSent(_HeadersSent):
+    """
+    The _ResponseSent event is fired whenever response headers are sent
+    on a stream.
+
+    This is an internal event, used to determine validation steps on
+    outgoing header blocks.
+    """
+    pass
+
+
+class _RequestSent(_HeadersSent):
+    """
+    The _RequestSent event is fired whenever request headers are sent
+    on a stream.
+
+    This is an internal event, used to determine validation steps on
+    outgoing header blocks.
+    """
+    pass
+
+
+class _TrailersSent(_HeadersSent):
+    """
+    The _TrailersSent event is fired whenever trailers are sent on a
+    stream. Trailers are a set of headers sent after the body of the
+    request/response, and are used to provide information that wasn't known
+    ahead of time (e.g. content-length).
+
+    This is an internal event, used to determine validation steps on
+    outgoing header blocks.
+    """
+    pass
+
+
 class InformationalResponseReceived(object):
     """
     The InformationalResponseReceived event is fired when an informational
@@ -184,6 +229,9 @@ class DataReceived(object):
     The DataReceived event is fired whenever data is received on a stream from
     the remote peer. The event carries the data itself, and the stream ID on
     which the data was received.
+
+    .. versionchanged:: 2.4.0
+       Added ``stream_ended`` property.
     """
     def __init__(self):
         #: The Stream ID for the stream this data was received on.
@@ -252,7 +300,7 @@ class RemoteSettingsChanged(object):
     When this event is received, the caller should confirm that the new
     settings are acceptable. If they are not acceptable, the user should close
     the connection with the error code :data:`PROTOCOL_ERROR
-    <h2.errors.PROTOCOL_ERROR>`.
+    <h2.errors.ErrorCodes.PROTOCOL_ERROR>`.
 
     .. versionchanged:: 2.0.0
        Prior to this version the user needed to acknowledge settings changes.
@@ -333,7 +381,8 @@ class StreamReset(object):
         #: The Stream ID of the stream that was reset.
         self.stream_id = None
 
-        #: The error code given.
+        #: The error code given. Either one of :class:`ErrorCodes
+        #: <h2.errors.ErrorCodes>` or ``int``
         self.error_code = None
 
         #: Whether the remote peer sent a RST_STREAM or we did.
@@ -437,7 +486,7 @@ class ConnectionTerminated(object):
     """
     def __init__(self):
         #: The error code cited when tearing down the connection. Should be
-        #: one of :data:`H2ERRORS <h2.errors.H2_ERRORS>`, but may not be if
+        #: one of :class:`ErrorCodes <h2.errors.ErrorCodes>`, but may not be if
         #: unknown HTTP/2 extensions are being used.
         self.error_code = None
 

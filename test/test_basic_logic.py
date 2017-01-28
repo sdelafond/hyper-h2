@@ -11,6 +11,7 @@ import sys
 import hyperframe
 import pytest
 
+import h2.config
 import h2.connection
 import h2.errors
 import h2.events
@@ -19,6 +20,9 @@ import h2.frame_buffer
 import h2.settings
 
 import helpers
+
+from hypothesis import given
+from hypothesis.strategies import integers
 
 
 IS_PYTHON3 = sys.version_info >= (3, 0)
@@ -64,6 +68,18 @@ class TestBasicClient(object):
         events = c.initiate_connection()
         assert not events
         assert c.data_to_send() == expected_data
+
+    def test_deprecated_properties(self):
+        """
+        We can access the deprecated properties.
+        """
+        config = h2.config.H2Configuration(
+            client_side=False, header_encoding=False
+        )
+        c = h2.connection.H2Connection(config=config)
+
+        assert c.client_side is False
+        assert c.header_encoding is False
 
     def test_sending_headers(self):
         """
@@ -142,7 +158,8 @@ class TestBasicClient(object):
         When receiving a response, the ResponseReceived event fires with bytes
         headers if the encoding is set appropriately.
         """
-        c = h2.connection.H2Connection(header_encoding=False)
+        config = h2.config.H2Configuration(header_encoding=False)
+        c = h2.connection.H2Connection(config=config)
         c.initiate_connection()
         c.send_headers(1, self.example_request_headers, end_stream=True)
 
@@ -158,6 +175,44 @@ class TestBasicClient(object):
         assert isinstance(event, h2.events.ResponseReceived)
         assert event.stream_id == 1
         assert event.headers == self.bytes_example_response_headers
+
+    def test_receiving_a_response_change_encoding(self, frame_factory):
+        """
+        When receiving a response, the ResponseReceived event fires with bytes
+        headers if the encoding is set appropriately, but if this changes then
+        the change reflects it.
+        """
+        config = h2.config.H2Configuration(header_encoding=False)
+        c = h2.connection.H2Connection(config=config)
+        c.initiate_connection()
+        c.send_headers(1, self.example_request_headers, end_stream=True)
+
+        f = frame_factory.build_headers_frame(
+            self.example_response_headers
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+
+        assert isinstance(event, h2.events.ResponseReceived)
+        assert event.stream_id == 1
+        assert event.headers == self.bytes_example_response_headers
+
+        c.send_headers(3, self.example_request_headers, end_stream=True)
+        c.header_encoding = 'utf-8'
+        f = frame_factory.build_headers_frame(
+            self.example_response_headers,
+            stream_id=3,
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+
+        assert isinstance(event, h2.events.ResponseReceived)
+        assert event.stream_id == 3
+        assert event.headers == self.example_response_headers
 
     def test_end_stream_without_data(self, frame_factory):
         """
@@ -298,7 +353,7 @@ class TestBasicClient(object):
             c.receive_data(f3.serialize())
 
         expected_frame = frame_factory.build_goaway_frame(
-            0, h2.errors.PROTOCOL_ERROR
+            0, h2.errors.ErrorCodes.PROTOCOL_ERROR
         )
         assert c.data_to_send() == expected_frame.serialize()
 
@@ -336,7 +391,10 @@ class TestBasicClient(object):
         large_binary_string = b''.join(
             random.choice(all_bytes) for _ in range(0, 256)
         )
-        test_headers = [('key', large_binary_string)]
+        test_headers = [
+            (':authority', 'example.com'),
+            ('key', large_binary_string)
+        ]
         c = h2.connection.H2Connection()
 
         # Greatly shrink the max frame size to force us over.
@@ -384,8 +442,16 @@ class TestBasicClient(object):
         """
         Sending headers using dict is deprecated but still valid.
         """
-        test_headers = {'key': 'value'}
-        c = h2.connection.H2Connection()
+        # One of the steps in the outbound header validation logic checks
+        # that we don't send a pseudo-header after we've sent a regular
+        # header.  We can't guarantee that if you send headers as a dict,
+        # because dicts are unordered.
+        config = h2.config.H2Configuration(
+            validate_outbound_headers=False
+        )
+
+        test_headers = {':authority': 'example.com', 'key': 'value'}
+        c = h2.connection.H2Connection(config=config)
 
         pytest.deprecated_call(c.send_headers, 1, test_headers)
 
@@ -400,7 +466,7 @@ class TestBasicClient(object):
 
         f = frame_factory.build_rst_stream_frame(
             stream_id=1,
-            error_code=5
+            error_code=h2.errors.ErrorCodes.STREAM_CLOSED,
         )
         events = c.receive_data(f.serialize())
 
@@ -409,7 +475,31 @@ class TestBasicClient(object):
 
         assert isinstance(event, h2.events.StreamReset)
         assert event.stream_id == 1
-        assert event.error_code == 5
+        assert event.error_code is h2.errors.ErrorCodes.STREAM_CLOSED
+        assert isinstance(event.error_code, h2.errors.ErrorCodes)
+        assert event.remote_reset
+
+    def test_handle_stream_reset_with_unknown_erorr_code(self, frame_factory):
+        """
+        Streams being remotely reset with unknown error codes behave exactly as
+        they do with known error codes, but the error code on the event is an
+        int, instead of being an ErrorCodes.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.send_headers(1, self.example_request_headers, end_stream=True)
+        c.clear_outbound_data_buffer()
+
+        f = frame_factory.build_rst_stream_frame(stream_id=1, error_code=0xFA)
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+
+        assert isinstance(event, h2.events.StreamReset)
+        assert event.stream_id == 1
+        assert event.error_code == 250
+        assert not isinstance(event.error_code, h2.errors.ErrorCodes)
         assert event.remote_reset
 
     def test_can_consume_partial_data_from_connection(self):
@@ -518,7 +608,7 @@ class TestBasicClient(object):
         c = h2.connection.H2Connection()
         c.initiate_connection()
         c.send_headers(1, self.example_request_headers)
-        f = frame_factory.build_headers_frame(self.example_request_headers)
+        f = frame_factory.build_headers_frame(self.example_response_headers)
         c.receive_data(f.serialize())
 
         # Send in trailers.
@@ -533,7 +623,7 @@ class TestBasicClient(object):
             c.receive_data(f.serialize())
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=0, error_code=h2.errors.PROTOCOL_ERROR,
+            last_stream_id=0, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
 
@@ -601,6 +691,56 @@ class TestBasicClient(object):
         )
 
         assert c.data_to_send() == expected_frame.serialize()
+
+    @given(frame_size=integers(min_value=2**14, max_value=(2**24 - 1)))
+    def test_changing_max_frame_size(self, frame_factory, frame_size):
+        """
+        When the user changes the max frame size and the change is ACKed, the
+        remote peer is now bound by the new frame size.
+        """
+        # We need to refresh the encoder because hypothesis has a problem with
+        # integrating with py.test, meaning that we use the same frame factory
+        # for all tests.
+        # See https://github.com/HypothesisWorks/hypothesis-python/issues/377
+        frame_factory.refresh_encoder()
+
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+
+        # Set up the stream.
+        c.send_headers(1, self.example_request_headers, end_stream=True)
+        headers_frame = frame_factory.build_headers_frame(
+            headers=self.example_response_headers,
+        )
+        c.receive_data(headers_frame.serialize())
+
+        # Change the max frame size.
+        c.update_settings({h2.settings.MAX_FRAME_SIZE: frame_size})
+        settings_ack = frame_factory.build_settings_frame({}, ack=True)
+        c.receive_data(settings_ack.serialize())
+
+        # Greatly increase the flow control windows: we're not here to test
+        # flow control today.
+        c.increment_flow_control_window(increment=(2 * frame_size) + 1)
+        c.increment_flow_control_window(
+            increment=(2 * frame_size) + 1, stream_id=1
+        )
+
+        # Send one DATA frame that is exactly the max frame size: confirm it's
+        # fine.
+        data = frame_factory.build_data_frame(
+            data=(b'\x00' * frame_size),
+        )
+        events = c.receive_data(data.serialize())
+        assert len(events) == 1
+        assert isinstance(events[0], h2.events.DataReceived)
+        assert events[0].flow_controlled_length == frame_size
+
+        # Send one that is one byte too large: confirm a protocol error is
+        # raised.
+        data.data += b'\x00'
+        with pytest.raises(h2.exceptions.ProtocolError):
+            c.receive_data(data.serialize())
 
 
 class TestBasicServer(object):
@@ -831,7 +971,7 @@ class TestBasicServer(object):
         assert not events
         assert c.data_to_send() == expected_data
 
-    @pytest.mark.parametrize("error_code", h2.errors.H2_ERRORS)
+    @pytest.mark.parametrize("error_code", h2.errors.ErrorCodes)
     def test_close_connection_with_error_code(self, frame_factory, error_code):
         """
         Closing the connection with an error code emits a GOAWAY frame with
@@ -863,7 +1003,8 @@ class TestBasicServer(object):
         """
         c = h2.connection.H2Connection(client_side=False)
         c.receive_data(frame_factory.preamble())
-        headers_frame = frame_factory.build_headers_frame([], stream_id=23)
+        headers_frame = frame_factory.build_headers_frame(
+            [(':authority', 'example.com')], stream_id=23)
         c.receive_data(headers_frame.serialize())
 
         f = frame_factory.build_goaway_frame(
@@ -920,7 +1061,7 @@ class TestBasicServer(object):
         assert not events
         assert c.data_to_send() == expected_data
 
-    @pytest.mark.parametrize("error_code", h2.errors.H2_ERRORS)
+    @pytest.mark.parametrize("error_code", h2.errors.ErrorCodes)
     def test_reset_stream_with_error_code(self, frame_factory, error_code):
         """
         Resetting a stream with an error code emits a RST_STREAM frame with
@@ -1184,7 +1325,7 @@ class TestBasicServer(object):
             c.receive_data(data_frame.serialize())
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=1, error_code=h2.errors.FRAME_SIZE_ERROR
+            last_stream_id=1, error_code=h2.errors.ErrorCodes.FRAME_SIZE_ERROR
         )
         assert c.data_to_send() == expected_frame.serialize()
 
@@ -1216,7 +1357,7 @@ class TestBasicServer(object):
             c.receive_data(f.serialize())
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=1, error_code=h2.errors.PROTOCOL_ERROR,
+            last_stream_id=1, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
 
@@ -1266,7 +1407,7 @@ class TestBasicServer(object):
             c.receive_data(f.serialize())
 
         expected_frame = frame_factory.build_goaway_frame(
-            last_stream_id=1, error_code=h2.errors.PROTOCOL_ERROR,
+            last_stream_id=1, error_code=h2.errors.ErrorCodes.PROTOCOL_ERROR,
         )
         assert c.data_to_send() == expected_frame.serialize()
 
@@ -1354,14 +1495,17 @@ class TestBasicServer(object):
         c.initiate_connection()
         c.receive_data(frame_factory.preamble())
 
-        f = frame_factory.build_goaway_frame(last_stream_id=5, error_code=4)
+        f = frame_factory.build_goaway_frame(
+            last_stream_id=5, error_code=h2.errors.ErrorCodes.SETTINGS_TIMEOUT
+        )
         events = c.receive_data(f.serialize())
 
         assert len(events) == 1
         event = events[0]
 
         assert isinstance(event, h2.events.ConnectionTerminated)
-        assert event.error_code == 4
+        assert event.error_code == h2.errors.ErrorCodes.SETTINGS_TIMEOUT
+        assert isinstance(event.error_code, h2.errors.ErrorCodes)
         assert event.last_stream_id == 5
         assert event.additional_data is None
         assert c.state_machine.state == h2.connection.ConnectionState.CLOSED
@@ -1405,3 +1549,30 @@ class TestBasicServer(object):
 
         assert isinstance(event, h2.events.ConnectionTerminated)
         assert event.additional_data == additional_data
+
+    def test_receiving_goaway_frame_with_unknown_error(self, frame_factory):
+        """
+        Receiving a GOAWAY frame with an unknown error code behaves exactly the
+        same as receiving one we know about, but the code is reported as an
+        integer instead of as an ErrorCodes.
+        """
+        c = h2.connection.H2Connection(client_side=False)
+        c.initiate_connection()
+        c.receive_data(frame_factory.preamble())
+
+        f = frame_factory.build_goaway_frame(
+            last_stream_id=5, error_code=0xFA
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        event = events[0]
+
+        assert isinstance(event, h2.events.ConnectionTerminated)
+        assert event.error_code == 250
+        assert not isinstance(event.error_code, h2.errors.ErrorCodes)
+        assert event.last_stream_id == 5
+        assert event.additional_data is None
+        assert c.state_machine.state == h2.connection.ConnectionState.CLOSED
+
+        assert not c.data_to_send()
