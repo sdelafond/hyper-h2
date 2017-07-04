@@ -20,9 +20,13 @@ import ssl
 import collections
 from typing import List, Tuple
 
+from h2.config import H2Configuration
 from h2.connection import H2Connection
-from h2.events import DataReceived, RequestReceived, StreamEnded
+from h2.events import (
+    ConnectionTerminated, DataReceived, RequestReceived, StreamEnded
+)
 from h2.errors import ErrorCodes
+from h2.exceptions import ProtocolError
 
 
 RequestData = collections.namedtuple('RequestData', ['headers', 'data'])
@@ -30,7 +34,8 @@ RequestData = collections.namedtuple('RequestData', ['headers', 'data'])
 
 class H2Protocol(asyncio.Protocol):
     def __init__(self):
-        self.conn = H2Connection(client_side=False)
+        config = H2Configuration(client_side=False, header_encoding='utf-8')
+        self.conn = H2Connection(config=config)
         self.transport = None
         self.stream_data = {}
 
@@ -40,18 +45,24 @@ class H2Protocol(asyncio.Protocol):
         self.transport.write(self.conn.data_to_send())
 
     def data_received(self, data: bytes):
-        events = self.conn.receive_data(data)
-        self.transport.write(self.conn.data_to_send())
-
-        for event in events:
-            if isinstance(event, RequestReceived):
-                self.request_received(event.headers, event.stream_id)
-            elif isinstance(event, DataReceived):
-                self.receive_data(event.data, event.stream_id)
-            elif isinstance(event, StreamEnded):
-                self.stream_complete(event.stream_id)
-
+        try:
+            events = self.conn.receive_data(data)
+        except ProtocolError as e:
             self.transport.write(self.conn.data_to_send())
+            self.transport.close()
+        else:
+            self.transport.write(self.conn.data_to_send())
+            for event in events:
+                if isinstance(event, RequestReceived):
+                    self.request_received(event.headers, event.stream_id)
+                elif isinstance(event, DataReceived):
+                    self.receive_data(event.data, event.stream_id)
+                elif isinstance(event, StreamEnded):
+                    self.stream_complete(event.stream_id)
+                elif isinstance(event, ConnectionTerminated):
+                    self.transport.close()
+
+                self.transport.write(self.conn.data_to_send())
 
     def request_received(self, headers: List[Tuple[str, str]], stream_id: int):
         headers = collections.OrderedDict(headers)
@@ -86,7 +97,7 @@ class H2Protocol(asyncio.Protocol):
         response_headers = (
             (':status', '200'),
             ('content-type', 'application/json'),
-            ('content-length', len(data)),
+            ('content-length', str(len(data))),
             ('server', 'asyncio-h2'),
         )
         self.conn.send_headers(stream_id, response_headers)
@@ -116,7 +127,6 @@ class H2Protocol(asyncio.Protocol):
             )
         else:
             stream_data.data.write(data)
-
 
 
 ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)

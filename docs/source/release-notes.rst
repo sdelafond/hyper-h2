@@ -9,6 +9,46 @@ document also includes a high-level prose overview of each major release after
 High Level Notes
 ----------------
 
+3.0.0: 24 March 2017
+~~~~~~~~~~~~~~~~~~~~
+
+The Hyper-h2 team and the Hyper project are delighted to announce the release
+of Hyper-h2 version 3.0.0! Unlike the really notable 2.0.0 release, this
+release is proportionally quite small: however, it has the effect of removing a
+lot of cruft and complexity that has built up in the codebase over the lifetime
+of the v2 release series.
+
+This release was motivated primarily by discovering that applications that
+attempted to use both HTTP/1.1 and HTTP/2 using hyper-h2 would encounter
+problems with cookies, because hyper-h2 did not join together cookie headers as
+required by RFC 7540. Normally adding such behaviour would be a non-breaking
+change, but we previously had no flags to prevent normalization of received
+HTTP headers.
+
+Because it makes no sense for the cookie to be split *by default*, we needed to
+add a controlling flag and set it to true. The breaking nature of this change
+is very subtle, and it's possible most users would never notice, but
+nevertheless it *is* a breaking change and we need to treat it as such.
+
+Happily, we can take this opportunity to finalise a bunch of deprecations we'd
+made over the past year. The v2 release series was long-lived and successful,
+having had a series of releases across the past year-and-a-bit, and the Hyper
+team are very proud of it. However, it's time to open a new chapter, and remove
+the deprecated code.
+
+The past year has been enormously productive for the Hyper team. A total of 30
+v2 releases were made, an enormous amount of work. A good number of people have
+made their first contribution in this time, more than I can thank reasonably
+without taking up an unreasonable amount of space in this document, so instead
+I invite you to check out `our awesome contributor list`_.
+
+We're looking forward to the next chapter in hyper-h2: it's been a fun ride so
+far, and we hope even more of you come along and join in the fun over the next
+year!
+
+.. _our awesome contributor list: https://github.com/python-hyper/hyper-h2/graphs/contributors
+
+
 2.0.0: 25 January 2016
 ~~~~~~~~~~~~~~~~~~~~~~
 
@@ -20,7 +60,7 @@ ever to use Hyper-h2 to build a compliant HTTP/2 server or client.
 An enormous chunk of this work has been focused on tighter enforcement of
 restrictions in RFC 7540, ensuring that we correctly police the actions of
 remote peers, and error appropriately when those peers violate the
-specification. Several of these constitute breaking changes, becuase data that
+specification. Several of these constitute breaking changes, because data that
 was previously received and handled without obvious error now raises
 ``ProtocolError`` exceptions and causes the connection to be terminated.
 
@@ -42,7 +82,7 @@ were an attempt to make a forward-looking guarantee that was entirely unneeded.
 
 Altogether, this has been an extremely productive period for Hyper-h2, and a
 lot of great work has been done by the community. To that end, we'd also like
-to extend a great thankyou to those contributers who made their first contribution
+to extend a great thankyou to those contributors who made their first contribution
 to the project between release 1.0.0 and 2.0.0. Many thanks to:
 `Thomas Kriechbaumer`_, `Alex Chan`_, `Maximilian Hils`_, and `Glyph`_. For a
 full historical list of contributors, see :doc:`contributors`.

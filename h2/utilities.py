@@ -19,11 +19,11 @@ UPPER_RE = re.compile(b"[A-Z]")
 # A set of headers that are hop-by-hop or connection-specific and thus
 # forbidden in HTTP/2. This list comes from RFC 7540 § 8.1.2.2.
 CONNECTION_HEADERS = frozenset([
-    b'connection', u'upgrade',
-    b'proxy-connection', u'transfer-encoding',
+    b'connection', u'connection',
+    b'proxy-connection', u'proxy-connection',
     b'keep-alive', u'keep-alive',
-    b'transfer-encoding', u'proxy-connection',
-    b'upgrade', u'connection',
+    b'transfer-encoding', u'transfer-encoding',
+    b'upgrade', u'upgrade',
 ])
 
 
@@ -41,6 +41,18 @@ _SECURE_HEADERS = frozenset([
     b'authorization', u'authorization',
     b'proxy-authorization', u'proxy-authorization',
 ])
+
+
+_REQUEST_ONLY_HEADERS = frozenset([
+    b':scheme', u':scheme',
+    b':path', u':path',
+    b':authority', u':authority',
+    b':method', u':method'
+])
+
+
+_RESPONSE_ONLY_HEADERS = frozenset([b':status', u':status'])
+
 
 if sys.version_info[0] == 2:  # Python 2.X
     _WHITESPACE = frozenset(whitespace)
@@ -171,7 +183,7 @@ def authority_from_headers(headers):
 # should be applied to a given set of headers.
 HeaderValidationFlags = collections.namedtuple(
     'HeaderValidationFlags',
-    ['is_client', 'is_trailer', 'is_response_header']
+    ['is_client', 'is_trailer', 'is_response_header', 'is_push_promise']
 )
 
 
@@ -209,8 +221,9 @@ def validate_headers(headers, hdr_validation_flags):
     headers = _check_host_authority_header(
         headers, hdr_validation_flags
     )
+    headers = _check_path_header(headers, hdr_validation_flags)
 
-    return list(headers)
+    return headers
 
 
 def _reject_uppercase_header_fields(headers, hdr_validation_flags):
@@ -288,6 +301,18 @@ def _custom_startswith(test_string, bytes_prefix, unicode_prefix):
         return test_string.startswith(unicode_prefix)
 
 
+def _assert_header_in_set(string_header, bytes_header, header_set):
+    """
+    Given a set of header names, checks whether the string or byte version of
+    the header name is present. Raises a Protocol error with the appropriate
+    error if it's missing.
+    """
+    if not (string_header in header_set or bytes_header in header_set):
+        raise ProtocolError(
+            "Header block missing mandatory %s header" % string_header
+        )
+
+
 def _reject_pseudo_header_fields(headers, hdr_validation_flags):
     """
     Raises a ProtocolError if duplicate pseudo-header fields are found in a
@@ -324,24 +349,50 @@ def _reject_pseudo_header_fields(headers, hdr_validation_flags):
 
         yield header
 
+    # Check the pseudo-headers we got to confirm they're acceptable.
+    _check_pseudo_header_field_acceptability(
+        seen_pseudo_header_fields, hdr_validation_flags
+    )
+
+
+def _check_pseudo_header_field_acceptability(pseudo_headers,
+                                             hdr_validation_flags):
+    """
+    Given the set of pseudo-headers present in a header block and the
+    validation flags, confirms that RFC 7540 allows them.
+    """
     # Pseudo-header fields MUST NOT appear in trailers - RFC 7540 § 8.1.2.1
-    if hdr_validation_flags.is_trailer and seen_pseudo_header_fields:
+    if hdr_validation_flags.is_trailer and pseudo_headers:
         raise ProtocolError(
-            "Received pseudo-header in trailer %s" %
-            seen_pseudo_header_fields
+            "Received pseudo-header in trailer %s" % pseudo_headers
         )
 
-    # If ':status' pseudo-header is not there in a response header, reject it
+    # If ':status' pseudo-header is not there in a response header, reject it.
+    # Similarly, if ':path', ':method', or ':scheme' are not there in a request
+    # header, reject it. Additionally, if a response contains any request-only
+    # headers or vice-versa, reject it.
     # Relevant RFC section: RFC 7540 § 8.1.2.4
     # https://tools.ietf.org/html/rfc7540#section-8.1.2.4
     if hdr_validation_flags.is_response_header:
-        seen_status_field = (
-            b':status' in seen_pseudo_header_fields or
-            u':status' in seen_pseudo_header_fields
-        )
-        if not seen_status_field:
+        _assert_header_in_set(u':status', b':status', pseudo_headers)
+        invalid_response_headers = pseudo_headers & _REQUEST_ONLY_HEADERS
+        if invalid_response_headers:
             raise ProtocolError(
-                "Response header block does not have a :status header"
+                "Encountered request-only headers %s" %
+                invalid_response_headers
+            )
+    elif (not hdr_validation_flags.is_response_header and
+          not hdr_validation_flags.is_trailer):
+        # This is a request, so we need to have seen :path, :method, and
+        # :scheme.
+        _assert_header_in_set(u':path', b':path', pseudo_headers)
+        _assert_header_in_set(u':method', b':method', pseudo_headers)
+        _assert_header_in_set(u':scheme', b':scheme', pseudo_headers)
+        invalid_request_headers = pseudo_headers & _RESPONSE_ONLY_HEADERS
+        if invalid_request_headers:
+            raise ProtocolError(
+                "Encountered response-only headers %s" %
+                invalid_request_headers
             )
 
 
@@ -402,12 +453,42 @@ def _check_host_authority_header(headers, hdr_validation_flags):
     but their values do not match.
     """
     # We only expect to see :authority and Host headers on request header
-    # blocks that aren't trailers, so skip this validation if we're on the
-    # server side or looking at trailer blocks.
-    if hdr_validation_flags.is_client or hdr_validation_flags.is_trailer:
+    # blocks that aren't trailers, so skip this validation if this is a
+    # response header or we're looking at trailer blocks.
+    skip_validation = (
+        hdr_validation_flags.is_response_header or
+        hdr_validation_flags.is_trailer
+    )
+    if skip_validation:
         return headers
 
     return _validate_host_authority_header(headers)
+
+
+def _check_path_header(headers, hdr_validation_flags):
+    """
+    Raise a ProtocolError if a header block arrives or is sent that contains an
+    empty :path header.
+    """
+    def inner():
+        for header in headers:
+            if header[0] in (b':path', u':path'):
+                if not header[1]:
+                    raise ProtocolError("An empty :path header is forbidden")
+
+            yield header
+
+    # We only expect to see :authority and Host headers on request header
+    # blocks that aren't trailers, so skip this validation if this is a
+    # response header or we're looking at trailer blocks.
+    skip_validation = (
+        hdr_validation_flags.is_response_header or
+        hdr_validation_flags.is_trailer
+    )
+    if skip_validation:
+        return headers
+    else:
+        return inner()
 
 
 def _lowercase_header_names(headers, hdr_validation_flags):
@@ -437,6 +518,15 @@ def _strip_surrounding_whitespace(headers, hdr_validation_flags):
             yield (header[0].strip(), header[1].strip())
 
 
+def _strip_connection_headers(headers, hdr_validation_flags):
+    """
+    Strip any connection headers as per RFC7540 § 8.1.2.2.
+    """
+    for header in headers:
+        if header[0] not in CONNECTION_HEADERS:
+            yield header
+
+
 def _check_sent_host_authority_header(headers, hdr_validation_flags):
     """
     Raises an InvalidHeaderBlockError if we try to send a header block
@@ -444,12 +534,39 @@ def _check_sent_host_authority_header(headers, hdr_validation_flags):
     the header block contains both fields, but their values do not match.
     """
     # We only expect to see :authority and Host headers on request header
-    # blocks that aren't trailers, so skip this validation if we're on the
-    # server side or looking at trailer blocks.
-    if not hdr_validation_flags.is_client or hdr_validation_flags.is_trailer:
+    # blocks that aren't trailers, so skip this validation if this is a
+    # response header or we're looking at trailer blocks.
+    skip_validation = (
+        hdr_validation_flags.is_response_header or
+        hdr_validation_flags.is_trailer
+    )
+    if skip_validation:
         return headers
 
     return _validate_host_authority_header(headers)
+
+
+def _combine_cookie_fields(headers, hdr_validation_flags):
+    """
+    RFC 7540 § 8.1.2.5 allows HTTP/2 clients to split the Cookie header field,
+    which must normally appear only once, into multiple fields for better
+    compression. However, they MUST be joined back up again when received.
+    This normalization step applies that transform. The side-effect is that
+    all cookie fields now appear *last* in the header block.
+    """
+    # There is a problem here about header indexing. Specifically, it's
+    # possible that all these cookies are sent with different header indexing
+    # values. At this point it shouldn't matter too much, so we apply our own
+    # logic and make them never-indexed.
+    cookies = []
+    for header in headers:
+        if header[0] == b'cookie':
+            cookies.append(header[1])
+        else:
+            yield header
+    if cookies:
+        cookie_val = b'; '.join(cookies)
+        yield NeverIndexedHeaderTuple(b'cookie', cookie_val)
 
 
 def normalize_outbound_headers(headers, hdr_validation_flags):
@@ -461,8 +578,20 @@ def normalize_outbound_headers(headers, hdr_validation_flags):
     """
     headers = _lowercase_header_names(headers, hdr_validation_flags)
     headers = _strip_surrounding_whitespace(headers, hdr_validation_flags)
+    headers = _strip_connection_headers(headers, hdr_validation_flags)
     headers = _secure_headers(headers, hdr_validation_flags)
 
+    return headers
+
+
+def normalize_inbound_headers(headers, hdr_validation_flags):
+    """
+    Normalizes a header sequence that we have received.
+
+    :param headers: The HTTP header set.
+    :param hdr_validation_flags: An instance of HeaderValidationFlags
+    """
+    headers = _combine_cookie_fields(headers, hdr_validation_flags)
     return headers
 
 
@@ -485,5 +614,6 @@ def validate_outbound_headers(headers, hdr_validation_flags):
     headers = _check_sent_host_authority_header(
         headers, hdr_validation_flags
     )
+    headers = _check_path_header(headers, hdr_validation_flags)
 
     return headers

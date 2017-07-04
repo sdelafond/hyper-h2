@@ -6,6 +6,9 @@ test_events.py
 Specific tests for any function that is logically self-contained as part of
 events.py.
 """
+import inspect
+import sys
+
 from hypothesis import given
 from hypothesis.strategies import (
     integers, lists, tuples
@@ -198,13 +201,16 @@ class TestEventReprs(object):
         """
         e = h2.events.RemoteSettingsChanged()
         e.changed_settings = {
-            h2.settings.INITIAL_WINDOW_SIZE: h2.settings.ChangedSetting(
-                h2.settings.INITIAL_WINDOW_SIZE, 2**16, 2**15),
+            h2.settings.SettingCodes.INITIAL_WINDOW_SIZE:
+                h2.settings.ChangedSetting(
+                    h2.settings.SettingCodes.INITIAL_WINDOW_SIZE, 2**16, 2**15
+                ),
         }
 
         assert repr(e) == (
-            "<RemoteSettingsChanged changed_settings:{4: ChangedSetting("
-            "setting=4, original_value=65536, new_value=32768)}>"
+            "<RemoteSettingsChanged changed_settings:{ChangedSetting("
+            "setting=SettingCodes.INITIAL_WINDOW_SIZE, original_value=65536, "
+            "new_value=32768)}>"
         )
 
     def test_pingacknowledged_repr(self):
@@ -263,13 +269,16 @@ class TestEventReprs(object):
         """
         e = h2.events.SettingsAcknowledged()
         e.changed_settings = {
-            h2.settings.INITIAL_WINDOW_SIZE: h2.settings.ChangedSetting(
-                h2.settings.INITIAL_WINDOW_SIZE, 2**16, 2**15),
+            h2.settings.SettingCodes.INITIAL_WINDOW_SIZE:
+                h2.settings.ChangedSetting(
+                    h2.settings.SettingCodes.INITIAL_WINDOW_SIZE, 2**16, 2**15
+                ),
         }
 
         assert repr(e) == (
-            "<SettingsAcknowledged changed_settings:{4: ChangedSetting("
-            "setting=4, original_value=65536, new_value=32768)}>"
+            "<SettingsAcknowledged changed_settings:{ChangedSetting("
+            "setting=SettingCodes.INITIAL_WINDOW_SIZE, original_value=65536, "
+            "new_value=32768)}>"
         )
 
     def test_priorityupdated_repr(self):
@@ -317,3 +326,33 @@ class TestEventReprs(object):
             '<AlternativeServiceAvailable origin:example.com, '
             'field_value:h2=":8000"; ma=60>'
         )
+
+    def test_unknownframereceived_repr(self):
+        """
+        UnknownFrameReceived has a useful debug representation.
+        """
+        e = h2.events.UnknownFrameReceived()
+        assert repr(e) == '<UnknownFrameReceived>'
+
+
+def all_events():
+    """
+    Generates all the classes (i.e., events) defined in h2.events.
+    """
+    for _, obj in inspect.getmembers(sys.modules['h2.events']):
+
+        # We are only interested in objects that are defined in h2.events;
+        # objects that are imported from other modules are not of interest.
+        if hasattr(obj, '__module__') and (obj.__module__ != 'h2.events'):
+            continue
+
+        if inspect.isclass(obj):
+            yield obj
+
+
+@pytest.mark.parametrize('event', all_events())
+def test_all_events_subclass_from_event(event):
+    """
+    Every event defined in h2.events subclasses from h2.events.Event.
+    """
+    assert (event is h2.events.Event) or issubclass(event, h2.events.Event)

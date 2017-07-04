@@ -14,6 +14,7 @@ import sys
 
 from curio import Kernel, Event, spawn, socket, ssl
 
+import h2.config
 import h2.connection
 import h2.events
 
@@ -64,8 +65,11 @@ class H2Server:
     HTTP/1.1.
     """
     def __init__(self, sock, root):
+        config = h2.config.H2Configuration(
+            client_side=False, header_encoding='utf-8'
+        )
         self.sock = sock
-        self.conn = h2.connection.H2Connection(client_side=False)
+        self.conn = h2.connection.H2Connection(config=config)
         self.root = root
         self.flow_control_events = {}
 
@@ -110,7 +114,7 @@ class H2Server:
             response_headers = (
                 (':status', '404'),
                 ('content-length', '0'),
-                ('server', 'twisted-h2'),
+                ('server', 'curio-h2'),
             )
             self.conn.send_headers(
                 stream_id, response_headers, end_stream=True
