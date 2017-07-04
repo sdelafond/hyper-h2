@@ -5,8 +5,6 @@ h2/stream
 
 An implementation of a HTTP/2 stream.
 """
-import warnings
-
 from enum import Enum, IntEnum
 from hpack import HeaderTuple
 from hyperframe.frame import (
@@ -19,15 +17,15 @@ from .events import (
     RequestReceived, ResponseReceived, DataReceived, WindowUpdated,
     StreamEnded, PushedStreamReceived, StreamReset, TrailersReceived,
     InformationalResponseReceived, AlternativeServiceAvailable,
-    _ResponseSent, _RequestSent, _TrailersSent
+    _ResponseSent, _RequestSent, _TrailersSent, _PushedRequestSent
 )
 from .exceptions import (
-    ProtocolError, StreamClosedError, InvalidBodyLengthError
+    ProtocolError, StreamClosedError, InvalidBodyLengthError, FlowControlError
 )
 from .utilities import (
     guard_increment_window, is_informational_response, authority_from_headers,
     validate_headers, validate_outbound_headers, normalize_outbound_headers,
-    HeaderValidationFlags, extract_method_header
+    HeaderValidationFlags, extract_method_header, normalize_inbound_headers
 )
 from .windows import WindowManager
 
@@ -64,6 +62,13 @@ class StreamInputs(Enum):
     UPGRADE_SERVER = 18  # Added 2.3.0
 
 
+class StreamClosedBy(Enum):
+    SEND_END_STREAM = 0
+    RECV_END_STREAM = 1
+    SEND_RST_STREAM = 2
+    RECV_RST_STREAM = 3
+
+
 # This array is initialized once, and is indexed by the stream states above.
 # It indicates whether a stream in the given state is open. The reason we do
 # this is that we potentially check whether a stream in a given state is open
@@ -97,6 +102,9 @@ class H2StreamStateMachine(object):
         self.trailers_sent = None
         self.headers_received = None
         self.trailers_received = None
+
+        # How the stream was closed. One of StreamClosedBy.
+        self.stream_closed_by = None
 
     def process_input(self, input_):
         """
@@ -202,10 +210,20 @@ class H2StreamStateMachine(object):
         event.stream_id = self.stream_id
         return [event]
 
+    def stream_half_closed(self, previous_state):
+        """
+        Fires when an END_STREAM flag is received in the OPEN state,
+        transitioning this stream to a HALF_CLOSED_REMOTE state.
+        """
+        event = StreamEnded()
+        event.stream_id = self.stream_id
+        return [event]
+
     def stream_ended(self, previous_state):
         """
         Fires when a stream is cleanly ended.
         """
+        self.stream_closed_by = StreamClosedBy.RECV_END_STREAM
         event = StreamEnded()
         event.stream_id = self.stream_id
         return [event]
@@ -214,6 +232,7 @@ class H2StreamStateMachine(object):
         """
         Fired when a stream is forcefully reset.
         """
+        self.stream_closed_by = StreamClosedBy.RECV_RST_STREAM
         event = StreamReset()
         event.stream_id = self.stream_id
         return [event]
@@ -248,7 +267,8 @@ class H2StreamStateMachine(object):
         if self.client is True:
             raise ProtocolError("Cannot push streams from client peers.")
 
-        return []
+        event = _PushedRequestSent()
+        return [event]
 
     def recv_push_promise(self, previous_state):
         """
@@ -268,7 +288,21 @@ class H2StreamStateMachine(object):
         event.parent_stream_id = self.stream_id
         return [event]
 
-    def send_reset(self, previous_state):
+    def send_end_stream(self, previous_state):
+        """
+        Called when an attempt is made to send END_STREAM in the
+        HALF_CLOSED_REMOTE state.
+        """
+        self.stream_closed_by = StreamClosedBy.SEND_END_STREAM
+
+    def send_reset_stream(self, previous_state):
+        """
+        Called when an attempt is made to send RST_STREAM in a non-closed
+        stream state.
+        """
+        self.stream_closed_by = StreamClosedBy.SEND_RST_STREAM
+
+    def reset_stream_on_error(self, previous_state):
         """
         Called when we need to forcefully emit another RST_STREAM frame on
         behalf of the state machine.
@@ -278,18 +312,28 @@ class H2StreamStateMachine(object):
         it's the first time we've done this if the stream is currently in a
         state other than CLOSED.
         """
-        events = []
-
-        if previous_state != StreamState.CLOSED:
-            event = StreamReset()
-            event.stream_id = self.stream_id
-            event.error_code = ErrorCodes.STREAM_CLOSED
-            event.remote_reset = False
-            events.append(event)
+        self.stream_closed_by = StreamClosedBy.SEND_RST_STREAM
 
         error = StreamClosedError(self.stream_id)
-        error._events = events
+
+        event = StreamReset()
+        event.stream_id = self.stream_id
+        event.error_code = ErrorCodes.STREAM_CLOSED
+        event.remote_reset = False
+        error._events = [event]
         raise error
+
+    def recv_on_closed_stream(self, previous_state):
+        """
+        Called when an unexpected frame is received on an already-closed
+        stream.
+
+        An endpoint that receives an unexpected frame should treat it as
+        a stream error or connection error with type STREAM_CLOSED, depending
+        on the specific frame. The error handling is done at a higher level:
+        this just raises the appropriate error.
+        """
+        raise StreamClosedError(self.stream_id)
 
     def send_on_closed_stream(self, previous_state):
         """
@@ -301,10 +345,28 @@ class H2StreamStateMachine(object):
         matches the standard API of the state machine, but provides more detail
         to the user.
         """
-        assert previous_state == StreamState.CLOSED
         raise StreamClosedError(self.stream_id)
 
-    def push_on_closed_stream(self, previous_state):
+    def recv_push_on_closed_stream(self, previous_state):
+        """
+        Called when a PUSH_PROMISE frame is received on a full stop
+        stream.
+
+        If the stream was closed by us sending a RST_STREAM frame, then we
+        presume that the PUSH_PROMISE was in flight when we reset the parent
+        stream. Rathen than accept the new stream, we just reset it.
+        Otherwise, we should call this a PROTOCOL_ERROR: pushing a stream on a
+        naturally closed stream is a real problem because it creates a brand
+        new stream that the remote peer now believes exists.
+        """
+        assert self.stream_closed_by is not None
+
+        if self.stream_closed_by == StreamClosedBy.SEND_RST_STREAM:
+            raise StreamClosedError(self.stream_id)
+        else:
+            raise ProtocolError("Attempted to push on closed stream.")
+
+    def send_push_on_closed_stream(self, previous_state):
         """
         Called when an attempt is made to push on an already-closed stream.
 
@@ -314,8 +376,42 @@ class H2StreamStateMachine(object):
         allowed to be there. The only recourse is to tear the whole connection
         down.
         """
-        assert previous_state == StreamState.CLOSED
         raise ProtocolError("Attempted to push on closed stream.")
+
+    def window_on_closed_stream(self, previous_state):
+        """
+        Called when a WINDOW_UPDATE frame is received on an already-closed
+        stream.
+
+        If we sent an END_STREAM frame, we just ignore the frame, as instructed
+        in RFC 7540 Section 5.1. Technically we should eventually consider
+        WINDOW_UPDATE in this state an error, but we don't have access to a
+        clock so we just always allow it. If we closed the stream for any other
+        reason, we behave as we do for receiving any other frame on a closed
+        stream.
+        """
+        assert self.stream_closed_by is not None
+
+        if self.stream_closed_by == StreamClosedBy.SEND_END_STREAM:
+            return []
+        return self.recv_on_closed_stream(previous_state)
+
+    def reset_on_closed_stream(self, previous_state):
+        """
+        Called when a RST_STREAM frame is received on an already-closed stream.
+
+        If we sent an END_STREAM frame, we just ignore the frame, as instructed
+        in RFC 7540 Section 5.1. Technically we should eventually consider
+        RST_STREAM in this state an error, but we don't have access to a clock
+        so we just always allow it. If we closed the stream for any other
+        reason, we behave as we do for receiving any other frame on a closed
+        stream.
+        """
+        assert self.stream_closed_by is not None
+
+        if self.stream_closed_by is StreamClosedBy.SEND_END_STREAM:
+            return []
+        return self.recv_on_closed_stream(previous_state)
 
     def send_informational_response(self, previous_state):
         """
@@ -479,7 +575,7 @@ _transitions = {
     (StreamState.IDLE, StreamInputs.RECV_HEADERS):
         (H2StreamStateMachine.request_received, StreamState.OPEN),
     (StreamState.IDLE, StreamInputs.RECV_DATA):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.reset_stream_on_error, StreamState.CLOSED),
     (StreamState.IDLE, StreamInputs.SEND_PUSH_PROMISE):
         (H2StreamStateMachine.send_new_pushed_stream,
             StreamState.RESERVED_LOCAL),
@@ -496,15 +592,15 @@ _transitions = {
 
     # State: reserved local
     (StreamState.RESERVED_LOCAL, StreamInputs.SEND_HEADERS):
-        (None, StreamState.HALF_CLOSED_REMOTE),
+        (H2StreamStateMachine.response_sent, StreamState.HALF_CLOSED_REMOTE),
     (StreamState.RESERVED_LOCAL, StreamInputs.RECV_DATA):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.reset_stream_on_error, StreamState.CLOSED),
     (StreamState.RESERVED_LOCAL, StreamInputs.SEND_WINDOW_UPDATE):
         (None, StreamState.RESERVED_LOCAL),
     (StreamState.RESERVED_LOCAL, StreamInputs.RECV_WINDOW_UPDATE):
         (H2StreamStateMachine.window_updated, StreamState.RESERVED_LOCAL),
     (StreamState.RESERVED_LOCAL, StreamInputs.SEND_RST_STREAM):
-        (None, StreamState.CLOSED),
+        (H2StreamStateMachine.send_reset_stream, StreamState.CLOSED),
     (StreamState.RESERVED_LOCAL, StreamInputs.RECV_RST_STREAM):
         (H2StreamStateMachine.stream_reset, StreamState.CLOSED),
     (StreamState.RESERVED_LOCAL, StreamInputs.SEND_ALTERNATIVE_SERVICE):
@@ -517,13 +613,13 @@ _transitions = {
         (H2StreamStateMachine.response_received,
             StreamState.HALF_CLOSED_LOCAL),
     (StreamState.RESERVED_REMOTE, StreamInputs.RECV_DATA):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.reset_stream_on_error, StreamState.CLOSED),
     (StreamState.RESERVED_REMOTE, StreamInputs.SEND_WINDOW_UPDATE):
         (None, StreamState.RESERVED_REMOTE),
     (StreamState.RESERVED_REMOTE, StreamInputs.RECV_WINDOW_UPDATE):
         (H2StreamStateMachine.window_updated, StreamState.RESERVED_REMOTE),
     (StreamState.RESERVED_REMOTE, StreamInputs.SEND_RST_STREAM):
-        (None, StreamState.CLOSED),
+        (H2StreamStateMachine.send_reset_stream, StreamState.CLOSED),
     (StreamState.RESERVED_REMOTE, StreamInputs.RECV_RST_STREAM):
         (H2StreamStateMachine.stream_reset, StreamState.CLOSED),
     (StreamState.RESERVED_REMOTE, StreamInputs.RECV_ALTERNATIVE_SERVICE):
@@ -541,13 +637,14 @@ _transitions = {
     (StreamState.OPEN, StreamInputs.SEND_END_STREAM):
         (None, StreamState.HALF_CLOSED_LOCAL),
     (StreamState.OPEN, StreamInputs.RECV_END_STREAM):
-        (H2StreamStateMachine.stream_ended, StreamState.HALF_CLOSED_REMOTE),
+        (H2StreamStateMachine.stream_half_closed,
+         StreamState.HALF_CLOSED_REMOTE),
     (StreamState.OPEN, StreamInputs.SEND_WINDOW_UPDATE):
         (None, StreamState.OPEN),
     (StreamState.OPEN, StreamInputs.RECV_WINDOW_UPDATE):
         (H2StreamStateMachine.window_updated, StreamState.OPEN),
     (StreamState.OPEN, StreamInputs.SEND_RST_STREAM):
-        (None, StreamState.CLOSED),
+        (H2StreamStateMachine.send_reset_stream, StreamState.CLOSED),
     (StreamState.OPEN, StreamInputs.RECV_RST_STREAM):
         (H2StreamStateMachine.stream_reset, StreamState.CLOSED),
     (StreamState.OPEN, StreamInputs.SEND_PUSH_PROMISE):
@@ -567,28 +664,26 @@ _transitions = {
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.SEND_HEADERS):
         (H2StreamStateMachine.response_sent, StreamState.HALF_CLOSED_REMOTE),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.RECV_HEADERS):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.reset_stream_on_error, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.SEND_DATA):
         (None, StreamState.HALF_CLOSED_REMOTE),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.RECV_DATA):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.reset_stream_on_error, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.SEND_END_STREAM):
-        (None, StreamState.CLOSED),
+        (H2StreamStateMachine.send_end_stream, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.SEND_WINDOW_UPDATE):
         (None, StreamState.HALF_CLOSED_REMOTE),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.RECV_WINDOW_UPDATE):
         (H2StreamStateMachine.window_updated, StreamState.HALF_CLOSED_REMOTE),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.SEND_RST_STREAM):
-        (None, StreamState.CLOSED),
+        (H2StreamStateMachine.send_reset_stream, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.RECV_RST_STREAM):
         (H2StreamStateMachine.stream_reset, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.SEND_PUSH_PROMISE):
         (H2StreamStateMachine.send_push_promise,
             StreamState.HALF_CLOSED_REMOTE),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.RECV_PUSH_PROMISE):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
-    (StreamState.HALF_CLOSED_REMOTE, StreamInputs.RECV_CONTINUATION):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.reset_stream_on_error, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_REMOTE, StreamInputs.SEND_INFORMATIONAL_HEADERS):
         (H2StreamStateMachine.send_informational_response,
             StreamState.HALF_CLOSED_REMOTE),
@@ -610,7 +705,7 @@ _transitions = {
     (StreamState.HALF_CLOSED_LOCAL, StreamInputs.RECV_WINDOW_UPDATE):
         (H2StreamStateMachine.window_updated, StreamState.HALF_CLOSED_LOCAL),
     (StreamState.HALF_CLOSED_LOCAL, StreamInputs.SEND_RST_STREAM):
-        (None, StreamState.CLOSED),
+        (H2StreamStateMachine.send_reset_stream, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_LOCAL, StreamInputs.RECV_RST_STREAM):
         (H2StreamStateMachine.stream_reset, StreamState.CLOSED),
     (StreamState.HALF_CLOSED_LOCAL, StreamInputs.RECV_PUSH_PROMISE):
@@ -625,32 +720,43 @@ _transitions = {
         (H2StreamStateMachine.recv_alt_svc, StreamState.HALF_CLOSED_LOCAL),
 
     # State: closed
-    (StreamState.CLOSED, StreamInputs.RECV_WINDOW_UPDATE):
-        (H2StreamStateMachine.window_updated, StreamState.CLOSED),
-    (StreamState.CLOSED, StreamInputs.RECV_RST_STREAM):
-        (None, StreamState.CLOSED),  # Swallow further RST_STREAMs
+    (StreamState.CLOSED, StreamInputs.RECV_END_STREAM):
+        (None, StreamState.CLOSED),
     (StreamState.CLOSED, StreamInputs.RECV_ALTERNATIVE_SERVICE):
         (None, StreamState.CLOSED),
 
-    # While closed, all other received frames should cause RST_STREAM
-    # frames to be emitted. END_STREAM is always carried *by* a frame,
-    # so it should do nothing.
+    # RFC 7540 Section 5.1 defines how the end point should react when
+    # receiving a frame on a closed stream with the following statements:
+    #
+    # > An endpoint that receives any frame other than PRIORITY after receiving
+    # > a RST_STREAM MUST treat that as a stream error of type STREAM_CLOSED.
+    # > An endpoint that receives any frames after receiving a frame with the
+    # > END_STREAM flag set MUST treat that as a connection error of type
+    # > STREAM_CLOSED.
     (StreamState.CLOSED, StreamInputs.RECV_HEADERS):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.recv_on_closed_stream, StreamState.CLOSED),
     (StreamState.CLOSED, StreamInputs.RECV_DATA):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.recv_on_closed_stream, StreamState.CLOSED),
+
+    # > WINDOW_UPDATE or RST_STREAM frames can be received in this state
+    # > for a short period after a DATA or HEADERS frame containing a
+    # > END_STREAM flag is sent.
+    (StreamState.CLOSED, StreamInputs.RECV_WINDOW_UPDATE):
+        (H2StreamStateMachine.window_on_closed_stream, StreamState.CLOSED),
+    (StreamState.CLOSED, StreamInputs.RECV_RST_STREAM):
+        (H2StreamStateMachine.reset_on_closed_stream, StreamState.CLOSED),
+
+    # > A receiver MUST treat the receipt of a PUSH_PROMISE on a stream that is
+    # > neither "open" nor "half-closed (local)" as a connection error of type
+    # > PROTOCOL_ERROR.
     (StreamState.CLOSED, StreamInputs.RECV_PUSH_PROMISE):
-        (H2StreamStateMachine.push_on_closed_stream, StreamState.CLOSED),
-    (StreamState.CLOSED, StreamInputs.RECV_END_STREAM):
-        (None, StreamState.CLOSED),
-    (StreamState.CLOSED, StreamInputs.RECV_CONTINUATION):
-        (H2StreamStateMachine.send_reset, StreamState.CLOSED),
+        (H2StreamStateMachine.recv_push_on_closed_stream, StreamState.CLOSED),
 
     # Also, users should be forbidden from sending on closed streams.
     (StreamState.CLOSED, StreamInputs.SEND_HEADERS):
         (H2StreamStateMachine.send_on_closed_stream, StreamState.CLOSED),
     (StreamState.CLOSED, StreamInputs.SEND_PUSH_PROMISE):
-        (H2StreamStateMachine.push_on_closed_stream, StreamState.CLOSED),
+        (H2StreamStateMachine.send_push_on_closed_stream, StreamState.CLOSED),
     (StreamState.CLOSED, StreamInputs.SEND_RST_STREAM):
         (H2StreamStateMachine.send_on_closed_stream, StreamState.CLOSED),
     (StreamState.CLOSED, StreamInputs.SEND_DATA):
@@ -700,6 +806,13 @@ class H2Stream(object):
         # The configuration for this stream.
         self.config = config
 
+    def __repr__(self):
+        return "<%s id:%d state:%r>" % (
+            type(self).__name__,
+            self.stream_id,
+            self.state_machine.state
+        )
+
     @property
     def inbound_flow_control_window(self):
         """
@@ -730,12 +843,21 @@ class H2Stream(object):
         """
         return self.state_machine.state == StreamState.CLOSED
 
+    @property
+    def closed_by(self):
+        """
+        Returns how the stream was closed, as one of StreamClosedBy.
+        """
+        return self.state_machine.stream_closed_by
+
     def upgrade(self, client_side):
         """
         Called by the connection to indicate that this stream is the initial
         request/response of an upgraded connection. Places the stream into an
         appropriate state.
         """
+        self.config.logger.debug("Upgrading %r", self)
+
         assert self.stream_id == 1
         input_ = (
             StreamInputs.UPGRADE_CLIENT if client_side
@@ -751,17 +873,7 @@ class H2Stream(object):
         Returns a list of HEADERS/CONTINUATION frames to emit as either headers
         or trailers.
         """
-        # Convert headers to two-tuples.
-        # FIXME: The fallback for dictionary headers is to be removed in 3.0.
-        try:
-            headers = headers.items()
-            warnings.warn(
-                "Implicit conversion of dictionaries to two-tuples for "
-                "headers is deprecated and will be removed in 3.0.",
-                DeprecationWarning
-            )
-        except AttributeError:
-            headers = headers
+        self.config.logger.debug("Send headers %s on %r", headers, self)
 
         # Because encoding headers makes an irreversible change to the header
         # compression context, we make the state transition before we encode
@@ -811,14 +923,14 @@ class H2Stream(object):
         stream header. Called on the stream that has the PUSH_PROMISE frame
         sent on it.
         """
+        self.config.logger.debug("Push stream %r", self)
+
         # Because encoding headers makes an irreversible change to the header
         # compression context, we make the state transition *first*.
 
-        # This does not trigger any events.
         events = self.state_machine.process_input(
             StreamInputs.SEND_PUSH_PROMISE
         )
-        assert not events
 
         ppf = PushPromiseFrame(self.stream_id)
         ppf.promised_stream_id = related_stream_id
@@ -842,12 +954,16 @@ class H2Stream(object):
         assert not events
         return []
 
-    def send_data(self, data, end_stream=False):
+    def send_data(self, data, end_stream=False, pad_length=None):
         """
         Prepare some data frames. Optionally end the stream.
 
         .. warning:: Does not perform flow control checks.
         """
+        self.config.logger.debug(
+            "Send data on %r with end stream set to %s", self, end_stream
+        )
+
         self.state_machine.process_input(StreamInputs.SEND_DATA)
 
         df = DataFrame(self.stream_id)
@@ -855,8 +971,12 @@ class H2Stream(object):
         if end_stream:
             self.state_machine.process_input(StreamInputs.SEND_END_STREAM)
             df.flags.add('END_STREAM')
+        if pad_length is not None:
+            df.flags.add('PADDED')
+            df.pad_length = pad_length
 
-        self.outbound_flow_control_window -= len(data)
+        # Subtract flow_controlled_length to account for possible padding
+        self.outbound_flow_control_window -= df.flow_controlled_length
         assert self.outbound_flow_control_window >= 0
 
         return [df]
@@ -865,6 +985,8 @@ class H2Stream(object):
         """
         End a stream without sending data.
         """
+        self.config.logger.debug("End stream %r", self)
+
         self.state_machine.process_input(StreamInputs.SEND_END_STREAM)
         df = DataFrame(self.stream_id)
         df.flags.add('END_STREAM')
@@ -875,6 +997,9 @@ class H2Stream(object):
         Advertise an RFC 7838 alternative service. The semantics of this are
         better documented in the ``H2Connection`` class.
         """
+        self.config.logger.debug(
+            "Advertise alternative service of %r for %r", field_value, self
+        )
         self.state_machine.process_input(StreamInputs.SEND_ALTERNATIVE_SERVICE)
         asf = AltSvcFrame(self.stream_id)
         asf.field = field_value
@@ -884,6 +1009,10 @@ class H2Stream(object):
         """
         Increase the size of the flow control window for the remote side.
         """
+        self.config.logger.debug(
+            "Increase flow control window for %r by %d",
+            self, increment
+        )
         self.state_machine.process_input(StreamInputs.SEND_WINDOW_UPDATE)
         self._inbound_window_manager.window_opened(increment)
 
@@ -900,14 +1029,19 @@ class H2Stream(object):
         stream. This is called on the stream that has the PUSH_PROMISE sent
         on it.
         """
+        self.config.logger.debug(
+            "Receive Push Promise on %r for remote stream %d",
+            self, promised_stream_id
+        )
         events = self.state_machine.process_input(
             StreamInputs.RECV_PUSH_PROMISE
         )
         events[0].pushed_stream_id = promised_stream_id
 
-        if header_encoding:
-            headers = list(_decode_headers(headers, header_encoding))
-        events[0].headers = headers
+        hdr_validation_flags = self._build_hdr_validation_flags(events)
+        events[0].headers = self._process_received_headers(
+            headers, hdr_validation_flags, header_encoding
+        )
         return [], events
 
     def remotely_pushed(self, pushed_headers):
@@ -916,6 +1050,7 @@ class H2Stream(object):
         called immediately after initialization. Sends no frames, simply
         updates the state machine.
         """
+        self.config.logger.debug("%r pushed by remote peer", self)
         events = self.state_machine.process_input(
             StreamInputs.RECV_PUSH_PROMISE
         )
@@ -950,20 +1085,20 @@ class H2Stream(object):
             if not end_stream:
                 raise ProtocolError("Trailers must have END_STREAM set")
 
-        if self.config.validate_inbound_headers:
-            hdr_validation_flags = self._build_hdr_validation_flags(events)
-            headers = validate_headers(headers, hdr_validation_flags)
-
-        if header_encoding:
-            headers = list(_decode_headers(headers, header_encoding))
-
-        events[0].headers = headers
+        hdr_validation_flags = self._build_hdr_validation_flags(events)
+        events[0].headers = self._process_received_headers(
+            headers, hdr_validation_flags, header_encoding
+        )
         return [], events
 
     def receive_data(self, data, end_stream, flow_control_len):
         """
         Receive some data.
         """
+        self.config.logger.debug(
+            "Receive data on %r with end stream %s and flow control length "
+            "set to %d", self, end_stream, flow_control_len
+        )
         events = self.state_machine.process_input(StreamInputs.RECV_DATA)
         self._inbound_window_manager.window_consumed(flow_control_len)
         self._track_content_length(len(data), end_stream)
@@ -983,16 +1118,37 @@ class H2Stream(object):
         """
         Handle a WINDOW_UPDATE increment.
         """
+        self.config.logger.debug(
+            "Receive Window Update on %r for increment of %d",
+            self, increment
+        )
         events = self.state_machine.process_input(
             StreamInputs.RECV_WINDOW_UPDATE
         )
-        events[0].delta = increment
-        self.outbound_flow_control_window = guard_increment_window(
-            self.outbound_flow_control_window,
-            increment
-        )
+        frames = []
 
-        return [], events
+        # If we encounter a problem with incrementing the flow control window,
+        # this should be treated as a *stream* error, not a *connection* error.
+        # That means we need to catch the error and forcibly close the stream.
+        if events:
+            events[0].delta = increment
+            try:
+                self.outbound_flow_control_window = guard_increment_window(
+                    self.outbound_flow_control_window,
+                    increment
+                )
+            except FlowControlError:
+                # Ok, this is bad. We're going to need to perform a local
+                # reset.
+                event = StreamReset()
+                event.stream_id = self.stream_id
+                event.error_code = ErrorCodes.FLOW_CONTROL_ERROR
+                event.remote_reset = False
+
+                events = [event]
+                frames = self.reset_stream(event.error_code)
+
+        return frames, events
 
     def receive_continuation(self):
         """
@@ -1000,6 +1156,7 @@ class H2Stream(object):
         but the type of error it is depends on the state of the stream and must
         transition the state of the stream, so we need to handle it.
         """
+        self.config.logger.debug("Receive Continuation frame on %r", self)
         self.state_machine.process_input(
             StreamInputs.RECV_CONTINUATION
         )
@@ -1010,6 +1167,10 @@ class H2Stream(object):
         An Alternative Service frame was received on the stream. This frame
         inherits the origin associated with this stream.
         """
+        self.config.logger.debug(
+            "Receive Alternative Service frame on stream %r", self
+        )
+
         # If the origin is present, RFC 7838 says we have to ignore it.
         if frame.origin:
             return [], []
@@ -1032,6 +1193,9 @@ class H2Stream(object):
         """
         Close the stream locally. Reset the stream with an error code.
         """
+        self.config.logger.debug(
+            "Local reset %r with error code: %d", self, error_code
+        )
         self.state_machine.process_input(StreamInputs.SEND_RST_STREAM)
 
         rsf = RstStreamFrame(self.stream_id)
@@ -1042,6 +1206,9 @@ class H2Stream(object):
         """
         Handle a stream being reset remotely.
         """
+        self.config.logger.debug(
+            "Remote reset %r with error code: %d", self, frame.error_code
+        )
         events = self.state_machine.process_input(StreamInputs.RECV_RST_STREAM)
 
         if events:
@@ -1056,6 +1223,10 @@ class H2Stream(object):
         that was received on this stream. Pass that to the window manager and
         potentially return some WindowUpdate frames.
         """
+        self.config.logger.debug(
+            "Acknowledge received data with size %d on %r",
+            acknowledged_size, self
+        )
         increment = self._inbound_window_manager.process_bytes(
             acknowledged_size
         )
@@ -1071,30 +1242,26 @@ class H2Stream(object):
         Constructs a set of header validation flags for use when normalizing
         and validating header blocks.
         """
-        try:
-            is_trailer = isinstance(
-                events[0], (_TrailersSent, TrailersReceived)
+        is_trailer = isinstance(
+            events[0], (_TrailersSent, TrailersReceived)
+        )
+        is_response_header = isinstance(
+            events[0],
+            (
+                _ResponseSent,
+                ResponseReceived,
+                InformationalResponseReceived
             )
-            is_response_header = isinstance(
-                events[0], (_ResponseSent, ResponseReceived)
-            )
-        except IndexError:
-            # Some state changes don't emit an internal event (for example,
-            # sending a push promise).  We *always* emit an event for trailers,
-            # so the absence of an event means this definitely isn't a trailer.
-            # Similarly, we also emit an event whenever response headers are
-            # sent or received. So absence of those events means this is not an
-            # response header either.
-            #
-            # TODO: Find any places where we don't emit anything, and emit
-            # an internal event, so we can do away with this branch.
-            is_trailer = False
-            is_response_header = False
+        )
+        is_push_promise = isinstance(
+            events[0], (PushedStreamReceived, _PushedRequestSent)
+        )
 
         return HeaderValidationFlags(
             is_client=self.state_machine.client,
             is_trailer=is_trailer,
-            is_response_header=is_response_header
+            is_response_header=is_response_header,
+            is_push_promise=is_push_promise,
         )
 
     def _build_headers_frames(self,
@@ -1139,6 +1306,30 @@ class H2Stream(object):
 
         frames[-1].flags.add('END_HEADERS')
         return frames
+
+    def _process_received_headers(self,
+                                  headers,
+                                  header_validation_flags,
+                                  header_encoding):
+        """
+        When headers have been received from the remote peer, run a processing
+        pipeline on them to transform them into the appropriate form for
+        attaching to an event.
+        """
+        if self.config.normalize_inbound_headers:
+            headers = normalize_inbound_headers(
+                headers, header_validation_flags
+            )
+
+        if self.config.validate_inbound_headers:
+            headers = validate_headers(headers, header_validation_flags)
+
+        if header_encoding:
+            headers = _decode_headers(headers, header_encoding)
+
+        # The above steps are all generators, so we need to concretize the
+        # headers now.
+        return list(headers)
 
     def _initialize_content_length(self, headers):
         """

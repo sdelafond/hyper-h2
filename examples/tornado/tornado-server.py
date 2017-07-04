@@ -15,6 +15,7 @@ import tornado.ioloop
 import tornado.iostream
 import tornado.tcpserver
 
+from h2.config import H2Configuration
 from h2.connection import H2Connection
 from h2.events import RequestReceived, DataReceived
 
@@ -42,7 +43,9 @@ class EchoHeadersHandler(object):
 
     def __init__(self, stream):
         self.stream = stream
-        self.conn = H2Connection(client_side=False)
+
+        config = H2Configuration(client_side=False)
+        self.conn = H2Connection(config=config)
 
     @tornado.gen.coroutine
     def handle(self):
@@ -74,7 +77,7 @@ class EchoHeadersHandler(object):
         response_headers = (
             (':status', '200'),
             ('content-type', 'application/json'),
-            ('content-length', len(data)),
+            ('content-length', str(len(data))),
             ('server', 'tornado-h2'),
         )
         self.conn.send_headers(stream_id, response_headers)

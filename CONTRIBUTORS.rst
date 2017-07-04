@@ -99,7 +99,16 @@ In chronological order:
 
   - Added code to validate that trailers do not contain pseudo-header fields.
 
-Chun-Han, Hsiao (@chhsiao90)
+- Chun-Han, Hsiao (@chhsiao90)
 
   - Fixed a bug with invalid ``HTTP2-Settings`` header output in plaintext
     upgrade.
+
+- Bhavishya (@bhavishyagopesh)
+
+  - Added support for equality testing to ``h2.settings.Settings`` objects.
+
+- Fred Thomsen (@fredthomsen)
+
+  - Added logging.
+

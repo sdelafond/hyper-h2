@@ -18,6 +18,7 @@ import h2.events
 import h2.exceptions
 import h2.frame_buffer
 import h2.settings
+import h2.stream
 
 import helpers
 
@@ -69,18 +70,6 @@ class TestBasicClient(object):
         assert not events
         assert c.data_to_send() == expected_data
 
-    def test_deprecated_properties(self):
-        """
-        We can access the deprecated properties.
-        """
-        config = h2.config.H2Configuration(
-            client_side=False, header_encoding=False
-        )
-        c = h2.connection.H2Connection(config=config)
-
-        assert c.client_side is False
-        assert c.header_encoding is False
-
     def test_sending_headers(self):
         """
         Single headers frames are correctly encoded.
@@ -109,9 +98,116 @@ class TestBasicClient(object):
         c.clear_outbound_data_buffer()
         events = c.send_data(1, b'some data')
         assert not events
+        data_to_send = c.data_to_send()
         assert (
-            c.data_to_send() == b'\x00\x00\t\x00\x00\x00\x00\x00\x01some data'
+            data_to_send == b'\x00\x00\t\x00\x00\x00\x00\x00\x01some data'
         )
+
+        buffer = h2.frame_buffer.FrameBuffer(server=False)
+        buffer.max_frame_size = 65535
+        buffer.add_data(data_to_send)
+        data_frame = list(buffer)[0]
+        sanity_check_data_frame(
+            data_frame=data_frame,
+            expected_flow_controlled_length=len(b'some data'),
+            expect_padded_flag=False,
+            expected_data_frame_pad_length=0
+        )
+
+    def test_sending_data_with_padding(self):
+        """
+        Single data frames with padding are encoded correctly.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.send_headers(1, self.example_request_headers)
+
+        # Clear the data, then send some data.
+        c.clear_outbound_data_buffer()
+        events = c.send_data(1, b'some data', pad_length=5)
+        assert not events
+        data_to_send = c.data_to_send()
+        assert data_to_send == (
+            b'\x00\x00\x0f\x00\x08\x00\x00\x00\x01'
+            b'\x05some data\x00\x00\x00\x00\x00'
+        )
+
+        buffer = h2.frame_buffer.FrameBuffer(server=False)
+        buffer.max_frame_size = 65535
+        buffer.add_data(data_to_send)
+        data_frame = list(buffer)[0]
+        sanity_check_data_frame(
+            data_frame=data_frame,
+            expected_flow_controlled_length=len(b'some data') + 1 + 5,
+            expect_padded_flag=True,
+            expected_data_frame_pad_length=5
+        )
+
+    def test_sending_data_with_zero_length_padding(self):
+        """
+        Single data frames with zero-length padding are encoded
+        correctly.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.send_headers(1, self.example_request_headers)
+
+        # Clear the data, then send some data.
+        c.clear_outbound_data_buffer()
+        events = c.send_data(1, b'some data', pad_length=0)
+        assert not events
+        data_to_send = c.data_to_send()
+        assert data_to_send == (
+            b'\x00\x00\x0a\x00\x08\x00\x00\x00\x01'
+            b'\x00some data'
+        )
+
+        buffer = h2.frame_buffer.FrameBuffer(server=False)
+        buffer.max_frame_size = 65535
+        buffer.add_data(data_to_send)
+        data_frame = list(buffer)[0]
+        sanity_check_data_frame(
+            data_frame=data_frame,
+            expected_flow_controlled_length=len(b'some data') + 1,
+            expect_padded_flag=True,
+            expected_data_frame_pad_length=0
+        )
+
+    @pytest.mark.parametrize("expected_error,pad_length", [
+        (None,  0),
+        (None, 255),
+        (None, None),
+        (ValueError, -1),
+        (ValueError, 256),
+        (TypeError, 'invalid'),
+        (TypeError, ''),
+        (TypeError, '10'),
+        (TypeError, {}),
+        (TypeError, ['1', '2', '3']),
+        (TypeError, []),
+        (TypeError, 1.5),
+        (TypeError, 1.0),
+        (TypeError, -1.0),
+    ])
+    def test_sending_data_with_invalid_padding_length(self,
+                                                      expected_error,
+                                                      pad_length):
+        """
+        ``send_data`` with a ``pad_length`` parameter that is an integer
+        outside the range of [0, 255] throws a ``ValueError``, and a
+        ``pad_length`` parameter which is not an ``integer`` type
+        throws a ``TypeError``.
+        """
+        c = h2.connection.H2Connection()
+        c.initiate_connection()
+        c.send_headers(1, self.example_request_headers)
+
+        c.clear_outbound_data_buffer()
+        if expected_error is not None:
+            with pytest.raises(expected_error):
+                c.send_data(1, b'some data', pad_length=pad_length)
+        else:
+            c.send_data(1, b'some data', pad_length=pad_length)
 
     def test_closing_stream_sending_data(self, frame_factory):
         """
@@ -136,7 +232,8 @@ class TestBasicClient(object):
         """
         When receiving a response, the ResponseReceived event fires.
         """
-        c = h2.connection.H2Connection()
+        config = h2.config.H2Configuration(header_encoding='utf-8')
+        c = h2.connection.H2Connection(config=config)
         c.initiate_connection()
         c.send_headers(1, self.example_request_headers, end_stream=True)
 
@@ -200,7 +297,7 @@ class TestBasicClient(object):
         assert event.headers == self.bytes_example_response_headers
 
         c.send_headers(3, self.example_request_headers, end_stream=True)
-        c.header_encoding = 'utf-8'
+        c.config.header_encoding = 'utf-8'
         f = frame_factory.build_headers_frame(
             self.example_response_headers,
             stream_id=3,
@@ -250,7 +347,8 @@ class TestBasicClient(object):
         Pushed streams fire a PushedStreamReceived event, followed by
         ResponseReceived when the response headers are received.
         """
-        c = h2.connection.H2Connection()
+        config = h2.config.H2Configuration(header_encoding='utf-8')
+        c = h2.connection.H2Connection(config=config)
         c.initiate_connection()
         c.send_headers(1, self.example_request_headers, end_stream=False)
 
@@ -289,7 +387,8 @@ class TestBasicClient(object):
         """
         Pushed headers are not decoded if the header encoding is set to False.
         """
-        c = h2.connection.H2Connection(header_encoding=False)
+        config = h2.config.H2Configuration(header_encoding=False)
+        c = h2.connection.H2Connection(config=config)
         c.initiate_connection()
         c.send_headers(1, self.example_request_headers, end_stream=False)
 
@@ -393,6 +492,9 @@ class TestBasicClient(object):
         )
         test_headers = [
             (':authority', 'example.com'),
+            (':path', '/'),
+            (':method', 'GET'),
+            (':scheme', 'https'),
             ('key', large_binary_string)
         ]
         c = h2.connection.H2Connection()
@@ -437,23 +539,6 @@ class TestBasicClient(object):
         buffer.add_data(data[-1:])
         headers = list(buffer)[0]
         assert isinstance(headers, hyperframe.frame.HeadersFrame)
-
-    def test_dict_headers(self):
-        """
-        Sending headers using dict is deprecated but still valid.
-        """
-        # One of the steps in the outbound header validation logic checks
-        # that we don't send a pseudo-header after we've sent a regular
-        # header.  We can't guarantee that if you send headers as a dict,
-        # because dicts are unordered.
-        config = h2.config.H2Configuration(
-            validate_outbound_headers=False
-        )
-
-        test_headers = {':authority': 'example.com', 'key': 'value'}
-        c = h2.connection.H2Connection(config=config)
-
-        pytest.deprecated_call(c.send_headers, 1, test_headers)
 
     def test_handle_stream_reset(self, frame_factory):
         """
@@ -524,8 +609,8 @@ class TestBasicClient(object):
         c.clear_outbound_data_buffer()
 
         new_settings = {
-            h2.settings.HEADER_TABLE_SIZE: 52,
-            h2.settings.ENABLE_PUSH: 0,
+            h2.settings.SettingCodes.HEADER_TABLE_SIZE: 52,
+            h2.settings.SettingCodes.ENABLE_PUSH: 0,
         }
         events = c.update_settings(new_settings)
         assert not events
@@ -541,8 +626,8 @@ class TestBasicClient(object):
         c.initiate_connection()
 
         new_settings = {
-            h2.settings.HEADER_TABLE_SIZE: 52,
-            h2.settings.ENABLE_PUSH: 0,
+            h2.settings.SettingCodes.HEADER_TABLE_SIZE: 52,
+            h2.settings.SettingCodes.ENABLE_PUSH: 0,
         }
         c.update_settings(new_settings)
 
@@ -566,7 +651,7 @@ class TestBasicClient(object):
         c.initiate_connection()
 
         f = frame_factory.build_settings_frame(
-            {h2.settings.MAX_CONCURRENT_STREAMS: 1}
+            {h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 1}
         )
         c.receive_data(f.serialize())[0]
 
@@ -580,7 +665,8 @@ class TestBasicClient(object):
         When two HEADERS blocks are received in the same stream from a
         server, the second set are trailers.
         """
-        c = h2.connection.H2Connection()
+        config = h2.config.H2Configuration(header_encoding='utf-8')
+        c = h2.connection.H2Connection(config=config)
         c.initiate_connection()
         c.send_headers(1, self.example_request_headers)
         f = frame_factory.build_headers_frame(self.example_response_headers)
@@ -715,7 +801,9 @@ class TestBasicClient(object):
         c.receive_data(headers_frame.serialize())
 
         # Change the max frame size.
-        c.update_settings({h2.settings.MAX_FRAME_SIZE: frame_size})
+        c.update_settings(
+            {h2.settings.SettingCodes.MAX_FRAME_SIZE: frame_size}
+        )
         settings_ack = frame_factory.build_settings_frame({}, ack=True)
         c.receive_data(settings_ack.serialize())
 
@@ -742,6 +830,82 @@ class TestBasicClient(object):
         with pytest.raises(h2.exceptions.ProtocolError):
             c.receive_data(data.serialize())
 
+    def test_cookies_are_joined_on_push(self, frame_factory):
+        """
+        RFC 7540 Section 8.1.2.5 requires that we join multiple Cookie headers
+        in a header block together when they're received on a push.
+        """
+        # This is a moderately varied set of cookie headers: some combined,
+        # some split.
+        cookie_headers = [
+            ('cookie',
+                'username=John Doe; expires=Thu, 18 Dec 2013 12:00:00 UTC'),
+            ('cookie', 'path=1'),
+            ('cookie', 'test1=val1; test2=val2')
+        ]
+        expected = (
+            'username=John Doe; expires=Thu, 18 Dec 2013 12:00:00 UTC; '
+            'path=1; test1=val1; test2=val2'
+        )
+
+        config = h2.config.H2Configuration(header_encoding='utf-8')
+        c = h2.connection.H2Connection(config=config)
+        c.initiate_connection()
+        c.send_headers(1, self.example_request_headers, end_stream=True)
+
+        f = frame_factory.build_push_promise_frame(
+            stream_id=1,
+            promised_stream_id=2,
+            headers=self.example_request_headers + cookie_headers
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        e = events[0]
+
+        cookie_fields = [(n, v) for n, v in e.headers if n == 'cookie']
+        assert len(cookie_fields) == 1
+
+        _, v = cookie_fields[0]
+        assert v == expected
+
+    def test_cookies_arent_joined_without_normalization(self, frame_factory):
+        """
+        If inbound header normalization is disabled, cookie headers aren't
+        joined.
+        """
+        # This is a moderately varied set of cookie headers: some combined,
+        # some split.
+        cookie_headers = [
+            ('cookie',
+                'username=John Doe; expires=Thu, 18 Dec 2013 12:00:00 UTC'),
+            ('cookie', 'path=1'),
+            ('cookie', 'test1=val1; test2=val2')
+        ]
+
+        config = h2.config.H2Configuration(
+            client_side=True,
+            normalize_inbound_headers=False,
+            header_encoding='utf-8'
+        )
+        c = h2.connection.H2Connection(config=config)
+        c.initiate_connection()
+        c.send_headers(1, self.example_request_headers, end_stream=True)
+
+        f = frame_factory.build_push_promise_frame(
+            stream_id=1,
+            promised_stream_id=2,
+            headers=self.example_request_headers + cookie_headers
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        e = events[0]
+
+        received_cookies = [(n, v) for n, v in e.headers if n == 'cookie']
+        assert len(received_cookies) == 3
+        assert cookie_headers == received_cookies
+
 
 class TestBasicServer(object):
     """
@@ -763,12 +927,15 @@ class TestBasicServer(object):
         (':status', '200'),
         ('server', 'hyper-h2/0.1.0')
     ]
+    server_config = h2.config.H2Configuration(
+        client_side=False, header_encoding='utf-8'
+    )
 
     def test_ignores_preamble(self):
         """
         The preamble does not cause any events or frames to be written.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         preamble = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
 
         events = c.receive_data(preamble)
@@ -780,7 +947,7 @@ class TestBasicServer(object):
         """
         The preamble can be sent in in less than a single buffer.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         preamble = b'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'
         events = []
 
@@ -795,7 +962,7 @@ class TestBasicServer(object):
         For server-side connections, initiate_connection sends a server
         preamble.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         expected_settings = frame_factory.build_settings_frame(
             c.local_settings
         )
@@ -809,7 +976,7 @@ class TestBasicServer(object):
         """
         When a headers frame is received a RequestReceived event fires.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         f = frame_factory.build_headers_frame(self.example_request_headers)
@@ -828,9 +995,10 @@ class TestBasicServer(object):
         When a headers frame is received a RequestReceived event fires with
         bytes headers if the encoding is set appropriately.
         """
-        c = h2.connection.H2Connection(
+        config = h2.config.H2Configuration(
             client_side=False, header_encoding=False
         )
+        c = h2.connection.H2Connection(config=config)
         c.receive_data(frame_factory.preamble())
 
         f = frame_factory.build_headers_frame(self.example_request_headers)
@@ -848,7 +1016,7 @@ class TestBasicServer(object):
         """
         Test that data received on a stream fires a DataReceived event.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         f1 = frame_factory.build_headers_frame(
@@ -874,7 +1042,7 @@ class TestBasicServer(object):
         Test that data received on a stream fires a DataReceived event that
         accounts for padding.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         f1 = frame_factory.build_headers_frame(
@@ -900,7 +1068,7 @@ class TestBasicServer(object):
         """
         Ping frames should be immediately ACKed.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         ping_data = b'\x01' * 8
@@ -920,7 +1088,7 @@ class TestBasicServer(object):
         """
         Settings frames should cause a RemoteSettingsChanged event to fire.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         f = frame_factory.build_settings_frame(
@@ -938,7 +1106,7 @@ class TestBasicServer(object):
         """
         Acknowledging settings causes appropriate Settings frame to be emitted.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         received_frame = frame_factory.build_settings_frame(
@@ -960,7 +1128,7 @@ class TestBasicServer(object):
         Closing the connection with no error code emits a GOAWAY frame with
         error code 0.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_goaway_frame(last_stream_id=0)
         expected_data = f.serialize()
@@ -977,7 +1145,7 @@ class TestBasicServer(object):
         Closing the connection with an error code emits a GOAWAY frame with
         that error code.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_goaway_frame(
             error_code=error_code, last_stream_id=0
@@ -1001,10 +1169,16 @@ class TestBasicServer(object):
         Closing the connection with last_stream_id set emits a GOAWAY frame
         with that value.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         headers_frame = frame_factory.build_headers_frame(
-            [(':authority', 'example.com')], stream_id=23)
+            [
+                (':authority', 'example.com'),
+                (':path', '/'),
+                (':scheme', 'https'),
+                (':method', 'GET'),
+            ],
+            stream_id=23)
         c.receive_data(headers_frame.serialize())
 
         f = frame_factory.build_goaway_frame(
@@ -1029,7 +1203,7 @@ class TestBasicServer(object):
         Closing the connection with additional debug data emits a GOAWAY frame
         with that data attached.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_goaway_frame(
             last_stream_id=0, additional_data=output
@@ -1047,7 +1221,7 @@ class TestBasicServer(object):
         Resetting a stream with no error code emits a RST_STREAM frame with
         error code 0.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(self.example_request_headers)
         c.receive_data(f.serialize())
@@ -1067,7 +1241,7 @@ class TestBasicServer(object):
         Resetting a stream with an error code emits a RST_STREAM frame with
         that error code.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(
             self.example_request_headers,
@@ -1090,7 +1264,7 @@ class TestBasicServer(object):
         """
         Resetting nonexistent streams raises NoSuchStreamError.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(
             self.example_request_headers,
@@ -1113,7 +1287,7 @@ class TestBasicServer(object):
         Sending ping frames serializes a ping frame on stream 0 with
         approriate opaque data.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         c.clear_outbound_data_buffer()
 
@@ -1142,7 +1316,7 @@ class TestBasicServer(object):
         """
         Sending a ping frame only works with 8-byte bytestrings.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         with pytest.raises(ValueError):
@@ -1152,7 +1326,7 @@ class TestBasicServer(object):
         """
         Receiving a PING acknolwedgement fires a PingAcknolwedged event.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         ping_data = b'\x01\x02\x03\x04\x05\x06\x07\x08'
@@ -1173,7 +1347,7 @@ class TestBasicServer(object):
         When the remote stream ends with a non-empty data frame a DataReceived
         event and a StreamEnded event are fired.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         f1 = frame_factory.build_headers_frame(
@@ -1199,7 +1373,7 @@ class TestBasicServer(object):
         """
         Pushing a stream causes a PUSH_PROMISE frame to be emitted.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(
             self.example_request_headers
@@ -1227,10 +1401,10 @@ class TestBasicServer(object):
         """
         When the remote peer has disabled stream pushing, we should fail.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_settings_frame(
-            {h2.settings.ENABLE_PUSH: 0}
+            {h2.settings.SettingCodes.ENABLE_PUSH: 0}
         )
         c.receive_data(f.serialize())
 
@@ -1251,13 +1425,13 @@ class TestBasicServer(object):
         Acknowledging a remote HEADER_TABLE_SIZE settings change causes us to
         change the header table size of our encoder.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         assert c.encoder.header_table_size == 4096
 
         received_frame = frame_factory.build_settings_frame(
-            {h2.settings.HEADER_TABLE_SIZE: 80}
+            {h2.settings.SettingCodes.HEADER_TABLE_SIZE: 80}
         )
         c.receive_data(received_frame.serialize())[0]
 
@@ -1270,14 +1444,14 @@ class TestBasicServer(object):
 
         For an explanation of why this test is this way around, see issue #37.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
 
         assert c.decoder.header_table_size == 4096
 
         expected_frame = frame_factory.build_settings_frame({}, ack=True)
         c.update_settings(
-            {h2.settings.HEADER_TABLE_SIZE: 80}
+            {h2.settings.SettingCodes.HEADER_TABLE_SIZE: 80}
         )
         c.receive_data(expected_frame.serialize())
         c.clear_outbound_data_buffer()
@@ -1289,7 +1463,7 @@ class TestBasicServer(object):
         The remote peer can shrink the maximum outbound frame size using
         settings.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.initiate_connection()
         c.receive_data(frame_factory.preamble())
 
@@ -1301,7 +1475,7 @@ class TestBasicServer(object):
             c.send_data(1, b'\x01' * 17000)
 
         received_frame = frame_factory.build_settings_frame(
-            {h2.settings.MAX_FRAME_SIZE: 17001}
+            {h2.settings.SettingCodes.MAX_FRAME_SIZE: 17001}
         )
         c.receive_data(received_frame.serialize())
 
@@ -1313,7 +1487,7 @@ class TestBasicServer(object):
         We throw ProtocolErrors and tear down connections if oversize frames
         are received.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         h = frame_factory.build_headers_frame(self.example_request_headers)
         c.receive_data(h.serialize())
@@ -1334,10 +1508,10 @@ class TestBasicServer(object):
         When the number of inbound streams exceeds our MAX_CONCURRENT_STREAMS
         setting, their attempt to open new streams fails.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         c.update_settings(
-            {h2.settings.MAX_CONCURRENT_STREAMS: 1}
+            {h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS: 1}
         )
         f = frame_factory.build_settings_frame({}, ack=True)
         c.receive_data(f.serialize())
@@ -1366,7 +1540,7 @@ class TestBasicServer(object):
         When two HEADERS blocks are received in the same stream from a
         client, the second set are trailers.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(self.example_request_headers)
         c.receive_data(f.serialize())
@@ -1390,7 +1564,7 @@ class TestBasicServer(object):
         When trailers are received without the END_STREAM flag being present,
         this is a ProtocolError.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(self.example_request_headers)
         c.receive_data(f.serialize())
@@ -1415,7 +1589,7 @@ class TestBasicServer(object):
         """
         When a second set of headers are sent, they are properly trailers.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(self.example_request_headers)
         c.receive_data(f.serialize())
@@ -1442,7 +1616,7 @@ class TestBasicServer(object):
         """
         A set of trailers must carry the END_STREAM flag.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         f = frame_factory.build_headers_frame(self.example_request_headers)
         c.receive_data(f.serialize())
@@ -1458,7 +1632,7 @@ class TestBasicServer(object):
 
     @pytest.mark.parametrize("frame_id", range(12, 256))
     def test_unknown_frames_are_ignored(self, frame_factory, frame_id):
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         c.clear_outbound_data_buffer()
 
@@ -1466,14 +1640,16 @@ class TestBasicServer(object):
         f.type = frame_id
 
         events = c.receive_data(f.serialize())
-        assert not events
         assert not c.data_to_send()
+        assert len(events) == 1
+        assert isinstance(events[0], h2.events.UnknownFrameReceived)
+        assert isinstance(events[0].frame, hyperframe.frame.ExtensionFrame)
 
     def test_can_send_goaway_repeatedly(self, frame_factory):
         """
         We can send a GOAWAY frame as many times as we like.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         c.clear_outbound_data_buffer()
 
@@ -1491,7 +1667,7 @@ class TestBasicServer(object):
         fired and transitions the connection to the CLOSED state, and clears
         the outbound data buffer.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.initiate_connection()
         c.receive_data(frame_factory.preamble())
 
@@ -1517,7 +1693,7 @@ class TestBasicServer(object):
         Multiple GOAWAY frames can be received at once, and are allowed. Each
         one fires a ConnectionTerminated event.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.receive_data(frame_factory.preamble())
         c.clear_outbound_data_buffer()
 
@@ -1535,7 +1711,7 @@ class TestBasicServer(object):
         GOAWAY frame can contain additional data,
         it should be available via ConnectionTerminated event.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.initiate_connection()
         c.receive_data(frame_factory.preamble())
 
@@ -1556,7 +1732,7 @@ class TestBasicServer(object):
         same as receiving one we know about, but the code is reported as an
         integer instead of as an ErrorCodes.
         """
-        c = h2.connection.H2Connection(client_side=False)
+        c = h2.connection.H2Connection(config=self.server_config)
         c.initiate_connection()
         c.receive_data(frame_factory.preamble())
 
@@ -1576,3 +1752,103 @@ class TestBasicServer(object):
         assert c.state_machine.state == h2.connection.ConnectionState.CLOSED
 
         assert not c.data_to_send()
+
+    def test_cookies_are_joined(self, frame_factory):
+        """
+        RFC 7540 Section 8.1.2.5 requires that we join multiple Cookie headers
+        in a header block together.
+        """
+        # This is a moderately varied set of cookie headers: some combined,
+        # some split.
+        cookie_headers = [
+            ('cookie',
+                'username=John Doe; expires=Thu, 18 Dec 2013 12:00:00 UTC'),
+            ('cookie', 'path=1'),
+            ('cookie', 'test1=val1; test2=val2')
+        ]
+        expected = (
+            'username=John Doe; expires=Thu, 18 Dec 2013 12:00:00 UTC; '
+            'path=1; test1=val1; test2=val2'
+        )
+
+        c = h2.connection.H2Connection(config=self.server_config)
+        c.initiate_connection()
+        c.receive_data(frame_factory.preamble())
+
+        f = frame_factory.build_headers_frame(
+            self.example_request_headers + cookie_headers
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        e = events[0]
+
+        cookie_fields = [(n, v) for n, v in e.headers if n == 'cookie']
+        assert len(cookie_fields) == 1
+
+        _, v = cookie_fields[0]
+        assert v == expected
+
+    def test_cookies_arent_joined_without_normalization(self, frame_factory):
+        """
+        If inbound header normalization is disabled, cookie headers aren't
+        joined.
+        """
+        # This is a moderately varied set of cookie headers: some combined,
+        # some split.
+        cookie_headers = [
+            ('cookie',
+                'username=John Doe; expires=Thu, 18 Dec 2013 12:00:00 UTC'),
+            ('cookie', 'path=1'),
+            ('cookie', 'test1=val1; test2=val2')
+        ]
+
+        config = h2.config.H2Configuration(
+            client_side=False,
+            normalize_inbound_headers=False,
+            header_encoding='utf-8'
+        )
+        c = h2.connection.H2Connection(config=config)
+        c.initiate_connection()
+        c.receive_data(frame_factory.preamble())
+
+        f = frame_factory.build_headers_frame(
+            self.example_request_headers + cookie_headers
+        )
+        events = c.receive_data(f.serialize())
+
+        assert len(events) == 1
+        e = events[0]
+
+        received_cookies = [(n, v) for n, v in e.headers if n == 'cookie']
+        assert len(received_cookies) == 3
+        assert cookie_headers == received_cookies
+
+    def test_stream_repr(self):
+        """
+        Ensure stream string representation is appropriate.
+        """
+        s = h2.stream.H2Stream(4, None, 12, 14)
+        assert repr(s) == "<H2Stream id:4 state:<StreamState.IDLE: 0>>"
+
+
+def sanity_check_data_frame(data_frame,
+                            expected_flow_controlled_length,
+                            expect_padded_flag,
+                            expected_data_frame_pad_length):
+    """
+    ``data_frame`` is a frame of type ``hyperframe.frame.DataFrame``,
+    and the ``flags`` and ``flow_controlled_length`` of ``data_frame``
+    match expectations.
+    """
+
+    assert isinstance(data_frame, hyperframe.frame.DataFrame)
+
+    assert data_frame.flow_controlled_length == expected_flow_controlled_length
+
+    if expect_padded_flag:
+        assert 'PADDED' in data_frame.flags
+    else:
+        assert 'PADDED' not in data_frame.flags
+
+    assert data_frame.pad_length == expected_data_frame_pad_length

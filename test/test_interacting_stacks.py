@@ -20,6 +20,7 @@ useful.
 """
 import coroutine_tests
 
+import h2.config
 import h2.connection
 import h2.events
 import h2.settings
@@ -29,21 +30,23 @@ class TestCommunication(coroutine_tests.CoroutineTestCase):
     """
     Test that two communicating state machines can work together.
     """
+    server_config = h2.config.H2Configuration(client_side=False)
+
     def test_basic_request_response(self):
         """
         A request issued by hyper-h2 can be responded to by hyper-h2.
         """
         request_headers = [
-            (':method', 'GET'),
-            (':path', '/'),
-            (':authority', 'example.com'),
-            (':scheme', 'https'),
-            ('user-agent', 'test-client/0.1.0'),
+            (b':method', b'GET'),
+            (b':path', b'/'),
+            (b':authority', b'example.com'),
+            (b':scheme', b'https'),
+            (b'user-agent', b'test-client/0.1.0'),
         ]
         response_headers = [
-            (':status', '204'),
-            ('server', 'test-server/0.1.0'),
-            ('content-length', '0'),
+            (b':status', b'204'),
+            (b'server', b'test-server/0.1.0'),
+            (b'content-length', b'0'),
         ]
 
         def client():
@@ -60,7 +63,9 @@ class TestCommunication(coroutine_tests.CoroutineTestCase):
             assert isinstance(events[1], h2.events.RemoteSettingsChanged)
             changed = events[1].changed_settings
             assert (
-                changed[h2.settings.MAX_CONCURRENT_STREAMS].new_value == 100
+                changed[
+                    h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS
+                ].new_value == 100
             )
 
             # Send a request.
@@ -79,7 +84,7 @@ class TestCommunication(coroutine_tests.CoroutineTestCase):
 
         @self.server
         def server():
-            c = h2.connection.H2Connection(client_side=False)
+            c = h2.connection.H2Connection(config=self.server_config)
 
             # First, read for the preamble.
             data = yield
@@ -88,7 +93,9 @@ class TestCommunication(coroutine_tests.CoroutineTestCase):
             assert isinstance(events[0], h2.events.RemoteSettingsChanged)
             changed = events[0].changed_settings
             assert (
-                changed[h2.settings.MAX_CONCURRENT_STREAMS].new_value == 100
+                changed[
+                    h2.settings.SettingCodes.MAX_CONCURRENT_STREAMS
+                ].new_value == 100
             )
 
             # Send our preamble back.
