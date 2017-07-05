@@ -3,7 +3,7 @@ Section: python
 Priority: optional
 Maintainer: Sebastien Delafond <seb@debian.org>
 Build-Depends: debhelper (>= 9), dh-python, python-all, python-setuptools,
- python-pytest, python-hyperframe, python-hpack, python-enum34,
+ python-pytest, python-hyperframe (>= 5.0), python-hpack, python-enum34,
  python-hypothesis, python3-all, python3-setuptools, python3-pytest,
  python3-hypothesis, python3-hyperframe, python3-hpack
 Standards-Version: 3.9.8
