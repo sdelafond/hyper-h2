@@ -8,13 +8,13 @@ Build-Depends: debhelper (>= 9), dh-python, python-all, python-setuptools,
  python3-hypothesis, python3-hyperframe, python3-hpack
 Standards-Version: 3.9.8
 Homepage: https://pypi.python.org/pypi/h2
-Vcs-Git: git://anonscm.debian.org/collab-maint/python-h2.git
+Vcs-Git: https://anonscm.debian.org/git/collab-maint/python-h2.git
 Vcs-Browser: https://anonscm.debian.org/git/collab-maint/python-h2.git
 
 Package: python-h2
 Architecture: all
 Depends: ${shlibs:Depends}, ${misc:Depends}, ${python:Depends}
-Description: Pure-Python HTTP/2 State-Machine based protocol implementation in python
+Description: Pure-Python HTTP/2 State-Machine based protocol implementation in Python
  This module contains a pure-Python HTTP/2 of a HTTP/2 protocol
  stack. It’s written from the ground up to be embeddable in whatever
  program you choose to use, ensuring that you can speak HTTP/2
@@ -23,7 +23,7 @@ Description: Pure-Python HTTP/2 State-Machine based protocol implementation in p
 Package: python3-h2
 Architecture: all
 Depends: ${shlibs:Depends}, ${misc:Depends}, ${python3:Depends}
-Description: Pure-Python3 HTTP/2 State-Machine based protocol implementation in python
+Description: Pure-Python3 HTTP/2 State-Machine based protocol implementation in Python
  This module contains a pure-Python HTTP/2 of a HTTP/2 protocol
  stack. It’s written from the ground up to be embeddable in whatever
  program you choose to use, ensuring that you can speak HTTP/2
