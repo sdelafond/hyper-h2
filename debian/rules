@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 
 export PYBUILD_NAME=h2
-export PYBUILD_TEST_ARGS="-k-test/test_rfc7838.py"
+export PYBUILD_TEST_ARGS=-k-test/test_rfc7838.py -k-test/test_invalid_headers.py
 
 %:
 	dh $@ --with python2,python3 --buildsystem=pybuild
