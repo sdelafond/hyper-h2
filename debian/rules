@@ -2,6 +2,8 @@
 
 export PYBUILD_NAME=h2
 export PYBUILD_TEST_ARGS=-k-test/test_rfc7838.py -k-test/test_invalid_headers.py
+# Don't install Hypothesis example database into binary package.
+export HYPOTHESIS_DATABASE_FILE = $(CURDIR)/debian/hypothesis
 
 %:
 	dh $@ --with python2,python3 --buildsystem=pybuild
