@@ -1,3 +1,9 @@
+python-h2 (3.0.1-2) unstable; urgency=medium
+
+  * Don't install Hypothesis example database into binary package (Closes: #885658).
+
+ -- Sebastien Delafond <seb@debian.org>  Mon, 01 Jan 2018 14:20:10 +0100
+
 python-h2 (3.0.1-1) unstable; urgency=medium
 
   * Imported Upstream version 3.0.1
