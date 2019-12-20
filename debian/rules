@@ -6,7 +6,7 @@ export PYBUILD_TEST_ARGS=-k-test/test_rfc7838.py -k-test/test_invalid_headers.py
 export HYPOTHESIS_DATABASE_FILE = $(CURDIR)/debian/hypothesis
 
 %:
-	dh $@ --with python2,python3 --buildsystem=pybuild
+	dh $@ --with python3 --buildsystem=pybuild
 
 override_dh_installchangelogs:
 	dh_installchangelogs HISTORY.rst
